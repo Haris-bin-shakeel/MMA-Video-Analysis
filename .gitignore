@@ -1,3 +1,9 @@
+# Python environment
 venv/
+
+# Python cache
 __pycache__/
 *.pyc
+
+# Large video files
+mma_fighter_analysis/Videos/
