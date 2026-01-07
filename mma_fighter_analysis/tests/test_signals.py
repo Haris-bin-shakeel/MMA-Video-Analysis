@@ -1,23 +1,16 @@
-# Basic unit tests (optional)
-
 """
 Test script for video loading and fighter selection.
-Tests the complete pipeline: Load video → Extract first frame → Manual selection
+Tests the complete pipeline: Load video → Extract first frame → Manual selection with role confirmation
 """
+
 import sys
 from pathlib import Path
 
 # Add project root to sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
-import sys
-from pathlib import Path
-
-# Add parent directory to path to import app modules
-
 from mma_fighter_analysis.app.core.video_loader import VideoLoader
 from mma_fighter_analysis.app.core.selector import FighterSelector, quick_select_fighters
-
 
 
 def test_video_loading(video_path: str):
@@ -80,13 +73,13 @@ def test_first_frame_extraction(video_path: str):
 
 def test_fighter_selection(video_path: str):
     """
-    Test 3: Manual fighter selection.
+    Test 3: Manual fighter selection with role confirmation.
     
     Args:
         video_path: Path to video file
     """
     print("\n" + "=" * 60)
-    print("TEST 3: MANUAL FIGHTER SELECTION")
+    print("TEST 3: MANUAL FIGHTER SELECTION WITH ROLE CONFIRMATION")
     print("=" * 60)
     
     try:
@@ -96,24 +89,33 @@ def test_fighter_selection(video_path: str):
         print("\n🎯 Starting interactive selection...")
         print("   A window will open - follow on-screen instructions\n")
         
-        # Use the selector
-        bboxes = quick_select_fighters(first_frame, num_fighters=2)
+        # Use the selector (now returns dictionary with roles)
+        fighters = quick_select_fighters(first_frame, num_fighters=2)
         
-        if len(bboxes) >= 2:
+        if fighters.get("my_fighter") and fighters.get("opponent"):
             print("\n✅ Fighter selection successful!")
-            print(f"\nSelected Fighters:")
-            for idx, bbox in enumerate(bboxes):
-                x, y, w, h = bbox
-                print(f"  Fighter {idx + 1}:")
-                print(f"    Position: (x={x}, y={y})")
-                print(f"    Size:     (width={w}, height={h})")
+            print(f"\nSelected Fighters with Roles:")
+            
+            x, y, w, h = fighters["my_fighter"]
+            print(f"\n  🔴 MY FIGHTER:")
+            print(f"    Position: (x={x}, y={y})")
+            print(f"    Size:     (width={w}, height={h})")
+            
+            x, y, w, h = fighters["opponent"]
+            print(f"\n  🔵 OPPONENT:")
+            print(f"    Position: (x={x}, y={y})")
+            print(f"    Size:     (width={w}, height={h})")
             
             video.close()
-            return bboxes
-        else:
-            print(f"\n⚠️  Only {len(bboxes)} fighter(s) selected (expected 2)")
+            return fighters
+        elif fighters.get("my_fighter") and not fighters.get("opponent"):
+            print(f"\n⚠️  Only one fighter selected (single fighter mode)")
             video.close()
-            return bboxes
+            return fighters
+        else:
+            print(f"\n⚠️  Incomplete selection")
+            video.close()
+            return None
             
     except Exception as e:
         print(f"\n❌ Fighter selection failed: {e}")
@@ -144,9 +146,9 @@ def test_complete_pipeline(video_path: str):
         print("\n❌ Pipeline failed at frame extraction")
         return False
     
-    # Test 3: Fighter Selection
-    bboxes = test_fighter_selection(video_path)
-    if bboxes is None or len(bboxes) < 1:
+    # Test 3: Fighter Selection with Role Confirmation
+    fighters = test_fighter_selection(video_path)
+    if fighters is None or not fighters.get("my_fighter"):
         print("\n❌ Pipeline failed at fighter selection")
         return False
     
@@ -154,10 +156,13 @@ def test_complete_pipeline(video_path: str):
     print("\n\n" + "=" * 60)
     print("🎉 ALL TESTS PASSED!")
     print("=" * 60)
-    print("\n✅ Video Loading:        PASS")
-    print("✅ Frame Extraction:     PASS")
-    print("✅ Fighter Selection:    PASS")
-    print("\n📊 Pipeline ready for tracking implementation!")
+    print("\n✅ Video Loading:           PASS")
+    print("✅ Frame Extraction:        PASS")
+    print("✅ Fighter Selection:       PASS")
+    print("✅ Role Confirmation:       PASS")
+    print("\n📊 Output Format Verified:")
+    print(f"   {fighters}")
+    print("\n🚀 Pipeline ready for tracking implementation!")
     print("=" * 60 + "\n")
     
     return True
