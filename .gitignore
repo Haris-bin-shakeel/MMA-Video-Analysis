@@ -1,9 +1,18 @@
-# Python environment
+# Python virtual environment
 venv/
 
-# Python cache
+# Byte-compiled / cache files
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Large video files
+# Videos (or any large media)
 mma_fighter_analysis/Videos/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
