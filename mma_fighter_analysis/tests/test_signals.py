@@ -1,12 +1,14 @@
 """
-Test script for video loading, fighter selection, and robust tracking.
-Tests the complete pipeline: Load video → Select fighters → Track through video
+Test script for video loading, fighter selection, tracking, and presence zones.
+Tests the complete pipeline:
+Load video → Select fighters → Track through video → Extract presence zones
 """
 
 import sys
 from pathlib import Path
 import cv2
 import numpy as np
+import json
 
 # Add project root to sys.path
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -88,6 +90,7 @@ def test_fighter_selection(video_path: str):
         else:
             video.close()
             return None
+
     except Exception as e:
         print(f"\n❌ Fighter selection failed: {e}")
         import traceback
@@ -95,112 +98,169 @@ def test_fighter_selection(video_path: str):
         return None
 
 
-# ------------------- TEST 4: ROBUST FIGHTER TRACKING ------------------- #
-class RobustTracker:
-    """Tracks two fighters with maximum reliability using CSRT → KCF → MOSSE."""
-    
-    def __init__(self, frame, my_bbox, opp_bbox=None):
-        self.frame = frame
-        self.my_bbox = self._clamp_bbox(my_bbox, frame)
-        self.opp_bbox = self._clamp_bbox(opp_bbox, frame) if opp_bbox else None
-
-        self.my_tracker = self._init_tracker(self.my_bbox, frame)
-        self.opp_tracker = self._init_tracker(self.opp_bbox, frame) if self.opp_bbox else None
-
-        self.my_pos = self.my_bbox
-        self.opp_pos = self.opp_bbox
-
-    @staticmethod
-    def _clamp_bbox(bbox, frame):
-        x, y, w, h = bbox
-        h_frame, w_frame = frame.shape[:2]
-        x = max(0, min(x, w_frame - 1))
-        y = max(0, min(y, h_frame - 1))
-        w = max(10, min(w, w_frame - x))
-        h = max(10, min(h, h_frame - y))
-        return (x, y, w, h)
-
-    @staticmethod
-    def _init_tracker(bbox, frame):
-        if bbox is None:
-            return None
-        trackers = [cv2.legacy.TrackerCSRT_create, cv2.legacy.TrackerKCF_create, cv2.legacy.TrackerMOSSE_create]
-        for t_func in trackers:
-            tracker = t_func()
-            ok = tracker.init(frame, bbox)
-            if ok:
-                return tracker
-        print("❌ Tracker failed to initialize")
-        return None
-
-    def update(self, frame):
-        # Update My Fighter
-        if self.my_tracker:
-            ok, bbox = self.my_tracker.update(frame)
-            if ok:
-                self.my_pos = self._ema(self.my_pos, bbox)
-        # Update Opponent
-        if self.opp_tracker:
-            ok, bbox = self.opp_tracker.update(frame)
-            if ok:
-                self.opp_pos = self._ema(self.opp_pos, bbox)
-        return self.my_pos, self.opp_pos
-
-    @staticmethod
-    def _ema(prev, curr, alpha=0.3):
-        """Exponential moving average for smooth tracking"""
-        x = int(prev[0] * (1 - alpha) + curr[0] * alpha)
-        y = int(prev[1] * (1 - alpha) + curr[1] * alpha)
-        w = int(prev[2] * (1 - alpha) + curr[2] * alpha)
-        h = int(prev[3] * (1 - alpha) + curr[3] * alpha)
-        return (x, y, w, h)
-
-
+# ------------------- TEST 4: ADAPTIVE FIGHTER TRACKING ------------------- #
 def test_tracking(video_path: str, fighters: dict):
+    """
+    Test 4: Adaptive fighter tracking through video.
+
+    Args:
+        video_path: Path to video file
+        fighters: Dictionary with my_fighter and opponent bboxes
+    """
     print("\n" + "=" * 60)
-    print("TEST 4: ROBUST FIGHTER TRACKING")
+    print("TEST 4: ADAPTIVE FIGHTER TRACKING")
     print("=" * 60)
 
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    tracker = None
+    try:
+        from mma_fighter_analysis.app.core.tracker import track_video
 
-    first_frame_ret, first_frame = cap.read()
-    if not first_frame_ret:
-        print("❌ Failed to read first frame")
+        print("\n🎯 Tracking with adaptive multi-tracker ensemble...")
+        print("   📺 Visual display enabled")
+        print("   ⌨️  Press 'Q' to quit, 'P' to pause\n")
+
+        tracker = track_video(
+            video_path=video_path,
+            my_fighter_bbox=fighters["my_fighter"],
+            opponent_bbox=fighters.get("opponent"),
+            progress_interval=100,
+            show_video=True,
+            save_video=False
+        )
+
+        print("\n✅ Tracking test successful!")
+        return tracker
+
+    except Exception as e:
+        print(f"\n❌ Tracking failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
-    robust_tracker = RobustTracker(first_frame, fighters["my_fighter"], fighters.get("opponent"))
 
-    frame_no = 1
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+# ------------------- TEST 5: PRESENCE ZONE EXTRACTION ------------------- #
+def test_presence_zones(video_path: str, tracker):
+    """
+    Test 5: Extract presence zones from tracking results.
 
-        my_bbox, opp_bbox = robust_tracker.update(frame)
+    Args:
+        video_path: Path to video file
+        tracker: DualFighterTracker instance
+    """
+    print("\n" + "=" * 60)
+    print("TEST 5: PRESENCE ZONE EXTRACTION")
+    print("=" * 60)
 
-        # Draw boxes
-        cv2.rectangle(frame, (my_bbox[0], my_bbox[1]), (my_bbox[0]+my_bbox[2], my_bbox[1]+my_bbox[3]), (0,0,255), 2)
-        if opp_bbox:
-            cv2.rectangle(frame, (opp_bbox[0], opp_bbox[1]), (opp_bbox[0]+opp_bbox[2], opp_bbox[1]+opp_bbox[3]), (255,255,0), 2)
+    try:
+        from mma_fighter_analysis.app.core.presence_zones import (
+            extract_presence_zones_from_tracker,
+            save_presence_zones
+        )
 
-        # Display
-        cv2.putText(frame, f"Frame {frame_no}/{total_frames}", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255),2)
-        cv2.imshow("Tracking", frame)
+        # Get video info for duration
+        video = VideoLoader(video_path)
+        video_info = video.get_video_info()
+        video.close()
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        if key == ord("p"):
-            cv2.waitKey(-1)  # pause until key press
+        print("\n🎯 Extracting presence zones from tracking history...")
 
-        frame_no += 1
+        # Extract zones
+        zones_data = extract_presence_zones_from_tracker(
+            tracker=tracker,
+            video_id=Path(video_path).stem,
+            video_duration=video_info["duration_seconds"],
+            gap_threshold=2.0,   # Merge zones if gap < 2 seconds
+            min_duration=1.0     # Minimum zone duration = 1 second
+        )
 
-    cap.release()
-    cv2.destroyAllWindows()
-    print("\n✅ Tracking completed successfully!")
-    return robust_tracker
+        # Create output directory
+        output_dir = Path("output")
+        output_dir.mkdir(exist_ok=True)
+
+        # Save zones to JSON
+        output_path = output_dir / f"{Path(video_path).stem}_presence_zones.json"
+        save_presence_zones(zones_data, str(output_path))
+
+        # Print JSON preview
+        print("\n" + "=" * 60)
+        print("📄 PRESENCE ZONES JSON OUTPUT (My Fighter)")
+        print("=" * 60)
+        print(json.dumps(zones_data["my_fighter"], indent=2))
+        
+        if zones_data["opponent"]["my_fighter_presence"]:
+            print("\n" + "=" * 60)
+            print("📄 PRESENCE ZONES JSON OUTPUT (Opponent)")
+            print("=" * 60)
+            print(json.dumps(zones_data["opponent"], indent=2))
+
+        print("\n✅ Presence zone extraction successful!")
+        return zones_data
+
+    except Exception as e:
+        print(f"\n❌ Presence zone extraction failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+# ------------------- TEST 6: BEHAVIORAL SIGNALS ------------------- #
+def test_behavioral_signals(video_path: str, tracker):
+    """
+    Test 6: Extract behavioral signals from tracking results.
+
+    Args:
+        video_path: Path to video file
+        tracker: DualFighterTracker instance
+    """
+    print("\n" + "=" * 60)
+    print("TEST 6: BEHAVIORAL SIGNAL EXTRACTION")
+    print("=" * 60)
+
+    try:
+        from mma_fighter_analysis.app.core.behavioral_signals import (
+            extract_behavioral_signals_from_tracker,
+            save_behavioral_signals
+        )
+
+        # Get video info
+        video = VideoLoader(video_path)
+        video_info = video.get_video_info()
+        video.close()
+
+        print("\n🎯 Extracting behavioral signals...")
+
+        # Extract signals
+        signals_data = extract_behavioral_signals_from_tracker(
+            tracker=tracker,
+            video_id=Path(video_path).stem,
+            fps=video_info["fps"],
+            frame_width=video_info["width"],
+            frame_height=video_info["height"]
+        )
+
+        # Create output directory
+        output_dir = Path("output")
+        output_dir.mkdir(exist_ok=True)
+
+        # Save signals to JSON
+        output_path = output_dir / f"{Path(video_path).stem}_behavioral_signals.json"
+        save_behavioral_signals(signals_data, str(output_path))
+
+        # Print sample signals
+        if signals_data["signals"]:
+            print("\n" + "=" * 60)
+            print("📄 BEHAVIORAL SIGNALS SAMPLE (First 3 seconds)")
+            print("=" * 60)
+            sample = signals_data["signals"][:3]
+            print(json.dumps({"video_id": signals_data["video_id"], "signals": sample}, indent=2))
+
+        print("\n✅ Behavioral signal extraction successful!")
+        return signals_data
+
+    except Exception as e:
+        print(f"\n❌ Behavioral signal extraction failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 # ------------------- COMPLETE PIPELINE ------------------- #
@@ -224,18 +284,37 @@ def test_complete_pipeline(video_path: str):
     if tracker is None:
         return False
 
+    zones = test_presence_zones(video_path, tracker)
+    if zones is None:
+        return False
+
+    signals = test_behavioral_signals(video_path, tracker)
+    if signals is None:
+        return False
+
     print("\n🎉 ALL TESTS PASSED!")
+    print("\n" + "=" * 60)
+    print("✅ DELIVERABLES GENERATED")
+    print("=" * 60)
+    print(f"📁 Presence Zones JSON:     output/{Path(video_path).stem}_presence_zones.json")
+    print(f"📁 Behavioral Signals JSON: output/{Path(video_path).stem}_behavioral_signals.json")
+    print("=" * 60)
+    
     return True
 
 
 # ------------------- MAIN EXECUTION ------------------- #
 def main():
     print("\n" + "═" * 60)
-    print("🥊 MMA VIDEO ANALYSIS - MODULE TESTS")
+    print("🥊 MMA VIDEO ANALYSIS - COMPLETE PIPELINE TEST")
     print("═" * 60)
 
     if len(sys.argv) < 2:
         print("\n❌ ERROR: No video path provided")
+        print("\nUsage:")
+        print("  python mma_fighter_analysis/tests/test_signals.py <video_path>")
+        print("\nExample:")
+        print("  python mma_fighter_analysis/tests/test_signals.py mma_fighter_analysis/Videos/testfight.mp4")
         sys.exit(1)
 
     video_path = sys.argv[1]

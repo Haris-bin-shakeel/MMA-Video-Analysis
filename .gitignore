@@ -16,3 +16,8 @@ mma_fighter_analysis/Videos/
 # OS files
 .DS_Store
 Thumbs.db
+# Ignore videos/output folder
+output/
+*.mp4
+*.avi
+*.mov

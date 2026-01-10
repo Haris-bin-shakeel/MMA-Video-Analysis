@@ -1,2 +1,0 @@
-# Behavioral signal calculations
-

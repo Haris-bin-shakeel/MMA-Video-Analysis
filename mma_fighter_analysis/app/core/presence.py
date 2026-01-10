@@ -1,2 +1,0 @@
-# Presence zone extraction & merging
-
