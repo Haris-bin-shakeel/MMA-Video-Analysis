@@ -1,2 +1,0 @@
-# Input validation & sanity checks
-
