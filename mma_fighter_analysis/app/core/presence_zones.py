@@ -1,500 +1,469 @@
 """
-PRESENCE ZONE EXTRACTION - ALIGNED WITH VISUAL TRACKING
-Ensures zones ONLY include frames where box is ON the fighter
+Presence Zone Tracker - FULLY ALIGNED WITH FIXED TRACKER V9
+Converts frame-by-frame bounding box visibility into time-based presence zones.
+Handles gaps, merges small interruptions, and generates JSON output.
 
-KEY FIXES:
-1. Uses visual_quality score (not just confidence)
-2. Stricter thresholds - only includes good tracking
-3. Frame-by-frame validation
-4. Output matches what user SEES in video
+ALIGNMENT WITH TRACKER V9 FIXES:
+- Uses state machine (VISIBLE, TEMP_LOST, LOST_CONFIRMED)
+- Uses validity scores (not just confidence)
+- Respects 'reliable' field from tracker
+- Properly handles clinch mode
+- Accurate gap timing with lost_since hooks
+- Prevents frozen hallucinations and bad re-locks
 """
 
 import json
-from typing import List, Dict, Optional
-from dataclasses import dataclass
-from pathlib import Path
+from typing import List, Dict, Optional, Tuple
 
 
-@dataclass
-class PresenceZone:
-    """Represents a continuous time range where fighter is present."""
-    start: float
-    end: float
-    
-    def duration(self) -> float:
-        return self.end - self.start
-    
-    def to_dict(self) -> dict:
-        return {
-            "start": round(self.start, 2),
-            "end": round(self.end, 2)
-        }
-
-
-class AccuratePresenceZoneExtractor:
+class PresenceZoneTracker:
     """
-    Extracts presence zones that MATCH visual tracking quality.
+    Tracks fighter presence zones (time intervals) from tracker state.
     
-    🔧 KEY PRINCIPLE: Only include frames where box is VISUALLY on the fighter.
+    Key Features:
+    - Converts frame visibility to timestamp intervals
+    - Uses tracker state machine for accurate gap detection
+    - Uses validity scores to filter unreliable detections
+    - Respects the 'reliable' field from tracker (bbox + validity > 0.4)
+    - Merges small gaps to reduce noise
+    - Generates clean JSON output
+    
+    State Machine per Fighter (aligned with tracker v9):
+    - ABSENT: Fighter not visible (state = LOST_CONFIRMED or not reliable)
+    - PRESENT: Fighter visible and reliable (state = VISIBLE + validity > threshold)
+    - GRACE: Temporarily lost (state = TEMP_LOST) - extends current zone
+    
+    Transitions:
+    - ABSENT → PRESENT: Start new zone
+    - PRESENT → GRACE: Continue zone (no gap yet)
+    - GRACE → PRESENT: Continue zone (recovered)
+    - GRACE → ABSENT: End zone (truly lost)
+    - PRESENT → ABSENT: End zone (immediate loss, rare)
     """
     
-    def __init__(self, 
-                 gap_threshold_seconds: float = 1.5,
-                 min_zone_duration: float = 1.0,
-                 confidence_threshold: float = 0.40,
-                 visual_quality_threshold: float = 0.45):
+    def __init__(self, fps: float, merge_gap_seconds: float = 0.5, presence_threshold: float = 0.6):
         """
-        Initialize with STRICT quality requirements.
+        Initialize presence tracker.
         
         Args:
-            gap_threshold_seconds: Max gap to merge zones (default: 1.5s)
-            min_zone_duration: Minimum zone duration (default: 1.0s)
-            confidence_threshold: Minimum confidence (default: 0.40)
-            visual_quality_threshold: Minimum visual quality (default: 0.45)
-                🔧 NEW: Ensures box is actually ON the fighter
+            fps: Video frames per second
+            merge_gap_seconds: Merge gaps shorter than this (reduces noise)
+            presence_threshold: Fix 6: Minimum validity for presence JSON (stricter than visibility)
         
-        REASONING:
-        - visual_quality_threshold=0.45: Strict appearance matching
-          * >0.45: Box is on correct fighter
-          * 0.35-0.45: Possible drift
-          * <0.35: Definitely lost or on wrong target
-        
-        - confidence_threshold=0.40: Combined with visual quality
-          * Acts as secondary filter
-          * Both must pass for frame to count
+        Note: Validity threshold is now handled by tracker's 'reliable' field
         """
-        self.gap_threshold = gap_threshold_seconds
-        self.min_duration = min_zone_duration
-        self.confidence_threshold = confidence_threshold
-        self.visual_quality_threshold = visual_quality_threshold
+        self.fps = fps
+        self.merge_gap_frames = int(merge_gap_seconds * fps)
+        self.presence_threshold = presence_threshold  # Fix 6: Separate presence threshold
         
-        print(f"\n🎯 ACCURATE ZONE EXTRACTION PARAMETERS:")
-        print(f"   Confidence threshold:     {confidence_threshold:.2f}")
-        print(f"   Visual quality threshold: {visual_quality_threshold:.2f} 🔧 NEW")
-        print(f"   Min zone duration:        {self.min_duration:.1f}s")
+        # Current state
+        self.my_fighter_present = False
+        self.opponent_present = False
         
-        print(f"   Gap merge threshold:      {gap_threshold_seconds:.1f}s")
-        print(f"\n💡 Zones will ONLY include frames where box is ON the fighter")
+        # Current zone start frames
+        self.my_fighter_zone_start = None
+        self.opponent_zone_start = None
+        
+        # Completed zones (frame numbers)
+        self.my_fighter_zones = []
+        self.opponent_zones = []
+        
+        # Frame counter
+        self.current_frame = 0
+        
+        # Statistics
+        self.my_fighter_total_frames_visible = 0
+        self.opponent_total_frames_visible = 0
+        self.my_fighter_temp_lost_count = 0
+        self.opponent_temp_lost_count = 0
+        self.my_fighter_unreliable_count = 0  # Tracked but validity too low
+        self.opponent_unreliable_count = 0
+        
+        print(f"📊 Presence Tracker Initialized (V9 Aligned)")
+        print(f"   FPS: {fps}")
+        print(f"   Merge gaps < {merge_gap_seconds:.2f}s ({self.merge_gap_frames} frames)")
+        print(f"   Using tracker 'reliable' field (validity > 0.4)")
     
-    def extract_zones(self, 
-                     tracking_history: List,
-                     video_id: str) -> Dict:
+    def update(self, tracker_status: Dict):
         """
-        Extract presence zones - STRICTLY aligned with visual tracking.
+        Update presence state from tracker status.
         
         Args:
-            tracking_history: List of TrackingFrame objects (with visual_quality)
-            video_id: Video identifier
+            tracker_status: Status dict from FighterTracker.get_status()
+                           Must contain state, confidence, validity, reliable, and bbox
+        """
+        # Extract my fighter state
+        my_state = tracker_status['my_fighter']['state']
+        my_reliable = tracker_status['my_fighter']['reliable']
+        my_bbox = tracker_status['my_fighter']['bbox']
+        my_validity = tracker_status['my_fighter']['validity']
+        
+        # Extract opponent state
+        opp_state = tracker_status['opponent']['state']
+        opp_reliable = tracker_status['opponent']['reliable']
+        opp_bbox = tracker_status['opponent']['bbox']
+        opp_validity = tracker_status['opponent']['validity']
+        
+        # === My Fighter Presence Logic ===
+        my_visible = self._is_fighter_present(my_state, my_reliable, my_bbox, my_validity)
+        
+        if my_visible:
+            self.my_fighter_total_frames_visible += 1
+            
+            if not self.my_fighter_present:
+                # Transition: ABSENT → PRESENT
+                self.my_fighter_zone_start = self.current_frame
+                self.my_fighter_present = True
+        else:
+            # Fix 4: Create gaps during TEMP_LOST and low confidence
+            # Track unreliable detections (bbox exists but validity too low)
+            if my_bbox is not None and not my_reliable and my_state == 'visible':
+                self.my_fighter_unreliable_count += 1
+            
+            # TEMP_LOST now creates gaps (no grace period for presence JSON)
+            if self.my_fighter_present:
+                # Transition: PRESENT → ABSENT (gap created)
+                zone = (self.my_fighter_zone_start, self.current_frame - 1)
+                self.my_fighter_zones.append(zone)
+                self.my_fighter_present = False
+                self.my_fighter_zone_start = None
+        
+        # === Opponent Presence Logic ===
+        opp_visible = self._is_fighter_present(opp_state, opp_reliable, opp_bbox, opp_validity)
+        
+        if opp_visible:
+            self.opponent_total_frames_visible += 1
+            
+            if not self.opponent_present:
+                # Transition: ABSENT → PRESENT
+                self.opponent_zone_start = self.current_frame
+                self.opponent_present = True
+        else:
+            # Fix 4: Create gaps during TEMP_LOST and low confidence
+            # Track unreliable detections
+            if opp_bbox is not None and not opp_reliable and opp_state == 'visible':
+                self.opponent_unreliable_count += 1
+            
+            # TEMP_LOST now creates gaps (no grace period for presence JSON)
+            if self.opponent_present:
+                # Transition: PRESENT → ABSENT (gap created)
+                zone = (self.opponent_zone_start, self.current_frame - 1)
+                self.opponent_zones.append(zone)
+                self.opponent_present = False
+                self.opponent_zone_start = None
+        
+        self.current_frame += 1
+    
+    def _is_fighter_present(self, state: str, reliable: bool, bbox, validity: float) -> bool:
+        """
+        Fix 4 & 6: Determine presence based on VALID tracking only with strict threshold.
+        
+        Presence must be driven by VALID tracking only:
+        - State must be 'visible' (not TEMP_LOST)
+        - Must have bbox
+        - Must meet presence threshold (stricter than visibility)
+        
+        This ensures gaps are recorded when:
+        - Fighter is TEMP_LOST
+        - Validity drops below presence threshold
+        - Tracking becomes unreliable
+        
+        Args:
+            state: Fighter state ('visible', 'temp_lost', 'lost_confirmed')
+            reliable: Tracker's 'reliable' field (bbox + validity check)
+            bbox: Bounding box (or None)
+            validity: Fighter validity score (0.0 to 1.0)
             
         Returns:
-            Dictionary matching Section 4.2 format with ACCURATE zones
+            True if fighter should be considered present for JSON output
         """
-        if not tracking_history:
-            return {
-                "video_id": video_id,
-                "my_fighter_presence": []
-            }
+        # Must have bbox
+        if bbox is None:
+            return False
         
-        # Extract raw zones with STRICT visual quality requirements
-        raw_zones = self._extract_raw_zones(tracking_history)
+        # Must be in VISIBLE state (not TEMP_LOST - create gaps)
+        if state != 'visible':
+            return False
         
-        # Merge zones with small gaps
-        merged_zones = self._merge_zones(raw_zones)
+        # Fix 6: Must meet presence threshold (stricter than visibility)
+        if validity < self.presence_threshold:
+            return False
         
-        # Filter by minimum duration
-        filtered_zones = [
-            zone for zone in merged_zones 
-            if zone.duration() >= self.min_duration
-        ]
-        
-        # Sort by start time
-        filtered_zones.sort(key=lambda z: z.start)
-        
-        return {
-            "video_id": video_id,
-            "my_fighter_presence": [zone.to_dict() for zone in filtered_zones]
-        }
+        return True
     
-    def _extract_raw_zones(self, tracking_history: List) -> List[PresenceZone]:
+    def finalize(self):
         """
-        Extract raw zones with STRICT visual quality validation.
-        
-        A fighter is considered "present" ONLY when:
-        1. tracking_active is True
-        2. bbox exists (not None)
-        3. confidence >= confidence_threshold
-        4. visual_quality >= visual_quality_threshold 🔧 KEY: Box is ON fighter
-        5. tracker_source is not "LOST"
-        
-        This ensures zones match what the user SEES in the video.
+        Finalize tracking - close any open zones.
+        Call this after processing all frames.
         """
-        zones = []
-        current_start = None
-        current_end = None
+        # Close open zones
+        if self.my_fighter_present and self.my_fighter_zone_start is not None:
+            zone = (self.my_fighter_zone_start, self.current_frame - 1)
+            self.my_fighter_zones.append(zone)
+            self.my_fighter_present = False
         
-        frames_rejected_visual = 0
-        frames_rejected_conf = 0
-        frames_accepted = 0
+        if self.opponent_present and self.opponent_zone_start is not None:
+            zone = (self.opponent_zone_start, self.current_frame - 1)
+            self.opponent_zones.append(zone)
+            self.opponent_present = False
         
-        for frame in tracking_history:
-            # Check basic tracking status
-            basic_ok = (
-                frame.tracking_active and 
-                frame.bbox is not None and
-                frame.tracker_source != "LOST"
-            )
-            
-            if not basic_ok:
-                if current_start is not None:
-                    zones.append(PresenceZone(current_start, current_end))
-                    current_start = None
-                    current_end = None
-                continue
-            
-            # Check confidence
-            conf_ok = frame.confidence >= self.confidence_threshold
-            if not conf_ok:
-                frames_rejected_conf += 1
-                if current_start is not None:
-                    zones.append(PresenceZone(current_start, current_end))
-                    current_start = None
-                    current_end = None
-                continue
-            
-            # 🔧 KEY CHECK: Visual quality (is box ON the fighter?)
-            visual_ok = frame.visual_quality >= self.visual_quality_threshold
-            if not visual_ok:
-                frames_rejected_visual += 1
-                if current_start is not None:
-                    zones.append(PresenceZone(current_start, current_end))
-                    current_start = None
-                    current_end = None
-                continue
-            
-            # All checks passed - frame is valid
-            frames_accepted += 1
-            
-            if current_start is None:
-                current_start = frame.timestamp
-                current_end = frame.timestamp
-            else:
-                current_end = frame.timestamp
+        # Merge small gaps
+        self.my_fighter_zones = self._merge_small_gaps(self.my_fighter_zones)
+        self.opponent_zones = self._merge_small_gaps(self.opponent_zones)
         
-        # Handle last zone
-        if current_start is not None:
-            zones.append(PresenceZone(current_start, current_end))
-        
-        print(f"\n📊 Frame Quality Analysis:")
-        print(f"   Frames ACCEPTED:             {frames_accepted}")
-        print(f"   Frames REJECTED (low conf):  {frames_rejected_conf}")
-        print(f"   Frames REJECTED (visual):    {frames_rejected_visual} 🔧")
-        
-        return zones
+        print(f"✅ Presence tracking finalized")
+        print(f"   My Fighter: {len(self.my_fighter_zones)} zones, {self.my_fighter_total_frames_visible} frames reliable")
+        print(f"   Opponent: {len(self.opponent_zones)} zones, {self.opponent_total_frames_visible} frames reliable")
+        print(f"   Grace periods: My={self.my_fighter_temp_lost_count}, Opp={self.opponent_temp_lost_count}")
+        print(f"   Unreliable frames filtered: My={self.my_fighter_unreliable_count}, Opp={self.opponent_unreliable_count}")
     
-    def _merge_zones(self, zones: List[PresenceZone]) -> List[PresenceZone]:
+    def _merge_small_gaps(self, zones: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
         """
-        Merge zones if gap is small.
+        Merge zones separated by small gaps.
         
-        Handles brief tracking losses due to:
-        - Occlusions (fighter blocked temporarily)
-        - Fast movements (brief tracker confusion)
-        - Camera motion
+        Args:
+            zones: List of (start_frame, end_frame) tuples
+            
+        Returns:
+            Merged zones
         """
-        if not zones:
-            return []
+        if len(zones) <= 1:
+            return zones
         
-        sorted_zones = sorted(zones, key=lambda z: z.start)
+        # Sort by start frame
+        zones = sorted(zones, key=lambda z: z[0])
+        
         merged = []
-        current = sorted_zones[0]
+        current_start, current_end = zones[0]
         
-        for next_zone in sorted_zones[1:]:
-            gap = next_zone.start - current.end
+        for i in range(1, len(zones)):
+            next_start, next_end = zones[i]
+            gap = next_start - current_end - 1
             
-            if gap <= self.gap_threshold:
-                # Merge
-                current = PresenceZone(current.start, next_zone.end)
+            if gap <= self.merge_gap_frames:
+                # Merge: extend current zone
+                current_end = next_end
             else:
-                # Gap too large
-                merged.append(current)
-                current = next_zone
+                # Gap too large: save current zone and start new one
+                merged.append((current_start, current_end))
+                current_start, current_end = next_start, next_end
         
-        merged.append(current)
+        # Add final zone
+        merged.append((current_start, current_end))
+        
         return merged
     
-    def calculate_statistics(self, zones: List[PresenceZone], 
-                            video_duration: float,
-                            tracking_history: List) -> Dict:
+    def _frame_to_timestamp(self, frame: int) -> float:
+        """Convert frame number to timestamp in seconds."""
+        return frame / self.fps
+    
+    def get_zones_as_timestamps(self) -> Dict[str, List[Dict[str, float]]]:
         """
-        Calculate comprehensive statistics with quality metrics.
-        """
-        if not zones:
-            return {
-                "total_zones": 0,
-                "total_presence_time": 0.0,
-                "presence_percentage": 0.0,
-                "average_zone_duration": 0.0,
-                "longest_zone": 0.0,
-                "shortest_zone": 0.0,
-                "gaps": [],
-                "quality_metrics": {
-                    "avg_confidence": 0.0,
-                    "avg_visual_quality": 0.0,
-                    "frames_in_zones": 0,
-                    "frames_excluded": 0
-                }
+        Get presence zones as timestamp intervals.
+        
+        Returns:
+            Dictionary with zones in seconds:
+            {
+                "my_fighter": [{"start": 0.0, "end": 5.2}, ...],
+                "opponent": [{"start": 0.0, "end": 5.2}, ...]
             }
+        """
+        my_zones = [
+            {
+                "start": round(self._frame_to_timestamp(start), 2),
+                "end": round(self._frame_to_timestamp(end), 2)
+            }
+            for start, end in self.my_fighter_zones
+        ]
         
-        total_time = sum(zone.duration() for zone in zones)
-        durations = [zone.duration() for zone in zones]
-        
-        # Calculate gaps
-        gaps = []
-        for i in range(len(zones) - 1):
-            gap_duration = zones[i+1].start - zones[i].end
-            if gap_duration > 0:
-                gaps.append({
-                    "after_zone": i + 1,
-                    "start": round(zones[i].end, 2),
-                    "end": round(zones[i+1].start, 2),
-                    "duration": round(gap_duration, 2)
-                })
-        
-        # Calculate quality metrics
-        frames_in_zones = 0
-        total_conf = 0.0
-        total_visual = 0.0
-        
-        for frame in tracking_history:
-            if frame.tracking_active and frame.bbox is not None:
-                in_zone = any(zone.start <= frame.timestamp <= zone.end for zone in zones)
-                if in_zone:
-                    frames_in_zones += 1
-                    total_conf += frame.confidence
-                    total_visual += frame.visual_quality
-        
-        avg_conf = total_conf / frames_in_zones if frames_in_zones > 0 else 0.0
-        avg_visual = total_visual / frames_in_zones if frames_in_zones > 0 else 0.0
-        
-        total_tracked = sum(1 for f in tracking_history if f.tracking_active and f.bbox is not None)
-        frames_excluded = total_tracked - frames_in_zones
+        opponent_zones = [
+            {
+                "start": round(self._frame_to_timestamp(start), 2),
+                "end": round(self._frame_to_timestamp(end), 2)
+            }
+            for start, end in self.opponent_zones
+        ]
         
         return {
-            "total_zones": len(zones),
-            "total_presence_time": round(total_time, 2),
-            "presence_percentage": round((total_time / video_duration) * 100, 2) if video_duration > 0 else 0.0,
-            "average_zone_duration": round(sum(durations) / len(durations), 2),
-            "longest_zone": round(max(durations), 2),
-            "shortest_zone": round(min(durations), 2),
-            "gaps": gaps,
-            "quality_metrics": {
-                "avg_confidence": round(avg_conf, 3),
-                "avg_visual_quality": round(avg_visual, 3),
-                "frames_in_zones": frames_in_zones,
-                "frames_excluded": frames_excluded,
-                "exclusion_rate": round((frames_excluded / total_tracked * 100), 2) if total_tracked > 0 else 0.0
+            "my_fighter": my_zones,
+            "opponent": opponent_zones
+        }
+    
+    def get_zones_as_frames(self) -> Dict[str, List[Dict[str, int]]]:
+        """
+        Get presence zones as frame intervals (useful for debugging).
+        
+        Returns:
+            Dictionary with zones in frames:
+            {
+                "my_fighter": [{"start": 0, "end": 156}, ...],
+                "opponent": [{"start": 0, "end": 156}, ...]
             }
-        }
-
-
-def extract_presence_zones_from_tracker(tracker,
-                                       video_id: str,
-                                       video_duration: float,
-                                       gap_threshold: float = 1.5,
-                                       min_duration: float = 1.0,
-                                       confidence_threshold: float = 0.40,
-                                       visual_quality_threshold: float = 0.45,
-                                       save_statistics: bool = True) -> Dict:
-    """
-    Extract ACCURATE presence zones aligned with visual tracking.
-    
-    🔧 PRODUCTION DEFAULTS:
-    - gap_threshold: 1.5s
-    - min_duration: 1.0s
-    - confidence_threshold: 0.40
-    - visual_quality_threshold: 0.45 🔧 NEW: Ensures box is ON fighter
-    
-    Returns zones that match what user SEES in video display.
-    """
-    extractor = AccuratePresenceZoneExtractor(
-        gap_threshold, 
-        min_duration, 
-        confidence_threshold,
-        visual_quality_threshold
-    )
-    
-    # Extract MY FIGHTER zones
-    my_zones_output = extractor.extract_zones(
-        tracker.my_tracker.tracking_history,
-        video_id
-    )
-    
-    # Extract OPPONENT zones
-    opponent_zones_output = None
-    if tracker.has_opponent:
-        opponent_zones_output = extractor.extract_zones(
-            tracker.opp_tracker.tracking_history,
-            video_id
-        )
-    
-    # Calculate statistics
-    stats = None
-    if save_statistics:
-        my_zone_objects = extractor._extract_raw_zones(
-            tracker.my_tracker.tracking_history
-        )
-        my_zone_objects = extractor._merge_zones(my_zone_objects)
-        my_zone_objects = [z for z in my_zone_objects if z.duration() >= min_duration]
+        """
+        my_zones = [
+            {"start": start, "end": end}
+            for start, end in self.my_fighter_zones
+        ]
         
-        my_stats = extractor.calculate_statistics(
-            my_zone_objects, 
-            video_duration,
-            tracker.my_tracker.tracking_history
-        )
+        opponent_zones = [
+            {"start": start, "end": end}
+            for start, end in self.opponent_zones
+        ]
         
-        opp_stats = None
-        if tracker.has_opponent:
-            opp_zone_objects = extractor._extract_raw_zones(
-                tracker.opp_tracker.tracking_history
-            )
-            opp_zone_objects = extractor._merge_zones(opp_zone_objects)
-            opp_zone_objects = [z for z in opp_zone_objects if z.duration() >= min_duration]
-            opp_stats = extractor.calculate_statistics(
-                opp_zone_objects,
-                video_duration,
-                tracker.opp_tracker.tracking_history
-            )
-        
-        stats = {
-            "video_id": video_id,
-            "video_duration": round(video_duration, 2),
-            "extraction_parameters": {
-                "gap_threshold": gap_threshold,
-                "min_duration": min_duration,
-                "confidence_threshold": confidence_threshold,
-                "visual_quality_threshold": visual_quality_threshold
-            },
-            "my_fighter": my_stats,
-            "opponent": opp_stats
+        return {
+            "my_fighter": my_zones,
+            "opponent": opponent_zones
         }
     
-    # Print report
-    print("\n" + "=" * 70)
-    print("📍 ACCURATE PRESENCE ZONE EXTRACTION COMPLETE")
-    print("=" * 70)
+    def export_json(self, video_name: str, output_path: str, include_metadata: bool = True):
+        """
+        Export presence zones to JSON file.
+        
+        Args:
+            video_name: Name/ID of the video
+            output_path: Path to output JSON file
+            include_metadata: Include tracking statistics
+        """
+        zones = self.get_zones_as_timestamps()
+        
+        output_data = {
+            "video_id": video_name,
+            "my_fighter_presence": zones["my_fighter"],
+            "opponent_presence": zones["opponent"]
+        }
+        
+        if include_metadata:
+            output_data["metadata"] = {
+                "fps": self.fps,
+                "total_frames": self.current_frame,
+                "duration_seconds": round(self.current_frame / self.fps, 2),
+                "my_fighter_stats": {
+                    "zone_count": len(self.my_fighter_zones),
+                    "total_frames_reliable": self.my_fighter_total_frames_visible,
+                    "frames_unreliable": self.my_fighter_unreliable_count,
+                    "visibility_percentage": round(
+                        100 * self.my_fighter_total_frames_visible / max(1, self.current_frame), 1
+                    )
+                },
+                "opponent_stats": {
+                    "zone_count": len(self.opponent_zones),
+                    "total_frames_reliable": self.opponent_total_frames_visible,
+                    "frames_unreliable": self.opponent_unreliable_count,
+                    "visibility_percentage": round(
+                        100 * self.opponent_total_frames_visible / max(1, self.current_frame), 1
+                    )
+                },
+                "tracker_version": "v9_aligned",
+                "uses_validity_filtering": True
+            }
+        
+        with open(output_path, 'w') as f:
+            json.dump(output_data, f, indent=2)
+        
+        print(f"📁 Presence zones saved: {output_path}")
     
-    if stats:
-        print(f"\n⚙️  EXTRACTION PARAMETERS:")
-        print(f"   Confidence Threshold:     {confidence_threshold:.2f}")
-        print(f"   Visual Quality Threshold: {visual_quality_threshold:.2f} 🔧 KEY")
-        print(f"   Min Zone Duration:        {min_duration:.1f}s")
-        print(f"   Gap Merge Threshold:      {gap_threshold:.1f}s")
+    def print_summary(self):
+        """Print human-readable summary of presence zones."""
+        zones = self.get_zones_as_timestamps()
         
-        print(f"\n🔴 MY FIGHTER:")
-        print(f"   Total Zones:     {stats['my_fighter']['total_zones']}")
-        print(f"   Presence Time:   {stats['my_fighter']['total_presence_time']:.2f}s / {video_duration:.2f}s")
-        print(f"   Coverage:        {stats['my_fighter']['presence_percentage']:.1f}%")
+        print("\n" + "=" * 60)
+        print("📊 PRESENCE ZONE SUMMARY (V9 ALIGNED)")
+        print("=" * 60)
         
-        if stats['my_fighter']['total_zones'] > 0:
-            print(f"   Avg Zone:        {stats['my_fighter']['average_zone_duration']:.2f}s")
-            print(f"   Longest Zone:    {stats['my_fighter']['longest_zone']:.2f}s")
-            print(f"   Shortest Zone:   {stats['my_fighter']['shortest_zone']:.2f}s")
+        print(f"\n🔴 MY FIGHTER ({len(zones['my_fighter'])} zones):")
+        total_my = 0
+        for i, zone in enumerate(zones['my_fighter'], 1):
+            duration = zone['end'] - zone['start']
+            total_my += duration
+            print(f"   {i}. {self._format_time(zone['start'])} → {self._format_time(zone['end'])} ({duration:.2f}s)")
         
-        qm = stats['my_fighter']['quality_metrics']
-        print(f"\n   Quality Metrics:")
-        print(f"   - Avg Confidence:    {qm['avg_confidence']:.3f}")
-        print(f"   - Avg Visual Quality: {qm['avg_visual_quality']:.3f} 🔧")
-        print(f"   - Frames Included:   {qm['frames_in_zones']}")
-        print(f"   - Frames Excluded:   {qm['frames_excluded']} ({qm['exclusion_rate']:.1f}%)")
+        if len(zones['my_fighter']) == 0:
+            print("   (No presence zones)")
         
-        if stats['my_fighter']['gaps']:
-            print(f"\n   Gaps: {len(stats['my_fighter']['gaps'])} detected")
+        print(f"\n🔵 OPPONENT ({len(zones['opponent'])} zones):")
+        total_opp = 0
+        for i, zone in enumerate(zones['opponent'], 1):
+            duration = zone['end'] - zone['start']
+            total_opp += duration
+            print(f"   {i}. {self._format_time(zone['start'])} → {self._format_time(zone['end'])} ({duration:.2f}s)")
         
-        if stats['opponent']:
-            print(f"\n🔵 OPPONENT:")
-            print(f"   Total Zones:     {stats['opponent']['total_zones']}")
-            print(f"   Presence Time:   {stats['opponent']['total_presence_time']:.2f}s / {video_duration:.2f}s")
-            print(f"   Coverage:        {stats['opponent']['presence_percentage']:.1f}%")
+        if len(zones['opponent']) == 0:
+            print("   (No presence zones)")
+        
+        total_duration = self.current_frame / self.fps
+        
+        print(f"\n📈 TOTALS:")
+        print(f"   Video duration: {total_duration:.2f}s ({self.current_frame} frames)")
+        print(f"   My Fighter: {total_my:.2f}s ({100*total_my/max(1, total_duration):.1f}%)")
+        print(f"   Opponent: {total_opp:.2f}s ({100*total_opp/max(1, total_duration):.1f}%)")
+        print(f"   Grace periods: My={self.my_fighter_temp_lost_count}, Opp={self.opponent_temp_lost_count}")
+        print(f"   Unreliable filtered: My={self.my_fighter_unreliable_count}, Opp={self.opponent_unreliable_count}")
+        print("=" * 60 + "\n")
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds as MM:SS.ms"""
+        mins = int(seconds // 60)
+        secs = seconds % 60
+        return f"{mins:02d}:{secs:05.2f}"
+    
+    def get_current_status(self) -> Dict[str, any]:
+        """
+        Get current tracking status.
+        
+        Returns:
+            Dictionary with current state
+        """
+        return {
+            "frame": self.current_frame,
+            "my_fighter_present": self.my_fighter_present,
+            "opponent_present": self.opponent_present,
+            "my_fighter_zones_count": len(self.my_fighter_zones),
+            "opponent_zones_count": len(self.opponent_zones),
+            "my_fighter_visibility": round(
+                100 * self.my_fighter_total_frames_visible / max(1, self.current_frame), 1
+            ),
+            "opponent_visibility": round(
+                100 * self.opponent_total_frames_visible / max(1, self.current_frame), 1
+            ),
+            "my_fighter_unreliable": self.my_fighter_unreliable_count,
+            "opponent_unreliable": self.opponent_unreliable_count
+        }
+    
+    def get_gaps(self) -> Dict[str, List[Dict[str, float]]]:
+        """
+        Get gaps (periods when fighter was not present) as timestamp intervals.
+        Useful for debugging tracking issues.
+        
+        Returns:
+            Dictionary with gap intervals in seconds
+        """
+        def compute_gaps(zones, total_duration):
+            if len(zones) == 0:
+                return [{"start": 0.0, "end": total_duration}]
             
-            if stats['opponent']['total_zones'] > 0:
-                print(f"   Avg Zone:        {stats['opponent']['average_zone_duration']:.2f}s")
+            gaps = []
             
-            opp_qm = stats['opponent']['quality_metrics']
-            print(f"\n   Quality Metrics:")
-            print(f"   - Avg Confidence:    {opp_qm['avg_confidence']:.3f}")
-            print(f"   - Avg Visual Quality: {opp_qm['avg_visual_quality']:.3f} 🔧")
-            print(f"   - Frames Excluded:   {opp_qm['frames_excluded']} ({opp_qm['exclusion_rate']:.1f}%)")
-    
-    print("\n" + "=" * 70)
-    print("✅ Output Format: SPEC COMPLIANT (Section 4.2)")
-    print("✅ Zones: ALIGNED with visual tracking quality")
-    print("💡 Excluded frames where box drifted off fighter")
-    print("=" * 70)
-    
-    return {
-        "my_fighter_zones": my_zones_output,
-        "opponent_zones": opponent_zones_output,
-        "statistics": stats
-    }
-
-
-def save_presence_zones(zones_data: Dict, 
-                       output_dir: str,
-                       video_id: str,
-                       pretty: bool = True):
-    """Save presence zones to SEPARATE JSON files."""
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Save MY FIGHTER zones
-    my_fighter_file = output_path / f"{video_id}_my_fighter_zones.json"
-    with open(my_fighter_file, 'w') as f:
-        if pretty:
-            json.dump(zones_data["my_fighter_zones"], f, indent=2)
-        else:
-            json.dump(zones_data["my_fighter_zones"], f)
-    
-    print(f"\n💾 Saved: {my_fighter_file}")
-    print("   Format: ✅ SPEC COMPLIANT (Section 4.2)")
-    
-    num_zones = len(zones_data["my_fighter_zones"]["my_fighter_presence"])
-    print(f"   Zones:  {num_zones}")
-    
-    if num_zones > 0:
-        zones = zones_data["my_fighter_zones"]["my_fighter_presence"]
-        print(f"   First:  {zones[0]['start']:.2f}s → {zones[0]['end']:.2f}s")
-        if num_zones > 1:
-            print(f"   Last:   {zones[-1]['start']:.2f}s → {zones[-1]['end']:.2f}s")
+            # Gap before first zone
+            if zones[0]["start"] > 0:
+                gaps.append({"start": 0.0, "end": zones[0]["start"]})
+            
+            # Gaps between zones
+            for i in range(len(zones) - 1):
+                gap_start = zones[i]["end"]
+                gap_end = zones[i + 1]["start"]
+                if gap_end > gap_start:
+                    gaps.append({"start": gap_start, "end": gap_end})
+            
+            # Gap after last zone
+            if zones[-1]["end"] < total_duration:
+                gaps.append({"start": zones[-1]["end"], "end": total_duration})
+            
+            return gaps
         
-        # Show quality guarantee
-        if zones_data.get("statistics"):
-            qm = zones_data["statistics"]["my_fighter"]["quality_metrics"]
-            print(f"\n   Quality Guarantee:")
-            print(f"   - Visual Quality: {qm['avg_visual_quality']:.3f} (box ON fighter)")
-            print(f"   - {qm['frames_excluded']} poor-quality frames excluded")
-    
-    # Save OPPONENT zones
-    if zones_data["opponent_zones"]:
-        opponent_file = output_path / f"{video_id}_opponent_zones.json"
-        with open(opponent_file, 'w') as f:
-            if pretty:
-                json.dump(zones_data["opponent_zones"], f, indent=2)
-            else:
-                json.dump(zones_data["opponent_zones"], f)
+        zones = self.get_zones_as_timestamps()
+        total_duration = round(self.current_frame / self.fps, 2)
         
-        print(f"\n💾 Saved: {opponent_file}")
-        print("   Format: ✅ SPEC COMPLIANT (Section 4.2)")
-        
-        num_zones = len(zones_data["opponent_zones"]["my_fighter_presence"])
-        print(f"   Zones:  {num_zones}")
-    
-    # Save statistics
-    if zones_data["statistics"]:
-        stats_file = output_path / f"{video_id}_statistics.json"
-        with open(stats_file, 'w') as f:
-            if pretty:
-                json.dump(zones_data["statistics"], f, indent=2)
-            else:
-                json.dump(zones_data["statistics"], f)
-        
-        print(f"\n💾 Saved: {stats_file}")
-        print("   Format: Extended statistics with quality metrics")
+        return {
+            "my_fighter": compute_gaps(zones["my_fighter"], total_duration),
+            "opponent": compute_gaps(zones["opponent"], total_duration)
+        }

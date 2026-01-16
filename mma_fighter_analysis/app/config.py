@@ -1,2 +1,0 @@
-# Thresholds & tunable parameters
-
