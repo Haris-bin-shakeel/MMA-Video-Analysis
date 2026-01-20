@@ -1826,4 +1826,3 @@ class FighterTracker:
             },
             "in_clinch": self.in_clinch
         }
-

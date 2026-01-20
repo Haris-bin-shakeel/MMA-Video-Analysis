@@ -1,6 +1,6 @@
 """
 MMA Fighter Analysis Pipeline - Test Runner
-Updated: January 2026 - Guaranteed to work
+Updated: January 2026 - Import errors fixed
 
 Run from project root:
     cd mma_fighter_analysis
@@ -34,90 +34,218 @@ print(f"Core dir:     {core_dir}")
 print(f"Core exists:  {core_dir.exists()}")
 print("=" * 80 + "\n")
 
-# Add paths to sys.path
-sys.path.insert(0, str(project_root))
-sys.path.insert(0, str(core_dir))
+# Add paths to sys.path (add at beginning for priority)
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+if str(core_dir) not in sys.path:
+    sys.path.insert(0, str(core_dir))
 
 # Change working directory to project root for relative paths
 os.chdir(str(project_root))
 
+print("Python path entries:")
+for idx, p in enumerate(sys.path[:5]):
+    print(f"  [{idx}] {p}")
+print()
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TRY MULTIPLE IMPORT STRATEGIES
+# IMPORT MODULES WITH MULTIPLE STRATEGIES
 # ══════════════════════════════════════════════════════════════════════════════
 
 VideoLoader = None
 quick_select_fighters = None
 FighterTracker = None
 PresenceZoneTracker = None
+BehavioralSignalExtractor = None
 
-# Strategy 1: Try package imports
+import_success = False
+import_errors = []
+
+# Strategy 1: Try package imports from app.core (cleanest approach)
 try:
-    from ..app.core.video_loader import VideoLoader
-    from ..app.core.selector import quick_select_fighters
-    from ..app.core.tracker import FighterTracker
-    from ..app.core.presence_zones import PresenceZoneTracker
-    print("✓ Imports successful using: from ..app.core.module import Class\n")
+    print("Attempting Strategy 1: from app.core import *")
+    from app.core import (
+        VideoLoader,
+        quick_select_fighters,
+        FighterTracker,
+        PresenceZoneTracker,
+        BehavioralSignalExtractor
+    )
+    print("✓ Strategy 1 successful!\n")
+    import_success = True
 except ImportError as e1:
-    print(f"Strategy 1 failed: {e1}")
-    
-    # Strategy 2: Try direct imports (core in path)
+    import_errors.append(("Strategy 1", str(e1)))
+    print(f"✗ Strategy 1 failed: {e1}\n")
+
+# Strategy 2: Try individual module imports (app.core.module)
+if not import_success:
     try:
-        from ..app.core.video_loader import VideoLoader
-        from ..app.core.selector import quick_select_fighters
-        from ..app.core.tracker import FighterTracker
-        from ..app.core.presence_zones import PresenceZoneTracker
-        print("✓ Imports successful using: from ..app.core.module import Class\n")
+        print("Attempting Strategy 2: from app.core.module import Class")
+        from app.core.video_loader import VideoLoader
+        from app.core.selector import quick_select_fighters
+        from app.core.tracker import FighterTracker
+        from app.core.presence_zones import PresenceZoneTracker
+        from app.core.behavioral_signals import BehavioralSignalExtractor
+        print("✓ Strategy 2 successful!\n")
+        import_success = True
     except ImportError as e2:
-        print(f"Strategy 2 failed: {e2}")
+        import_errors.append(("Strategy 2", str(e2)))
+        print(f"✗ Strategy 2 failed: {e2}\n")
+
+# Strategy 3: Try direct imports (module only)
+if not import_success:
+    try:
+        print("Attempting Strategy 3: from module import Class")
+        from video_loader import VideoLoader
+        from selector import quick_select_fighters
+        from tracker import FighterTracker
+        from presence_zones import PresenceZoneTracker
+        from behavioral_signals import BehavioralSignalExtractor
+        print("✓ Strategy 3 successful!\n")
+        import_success = True
+    except ImportError as e3:
+        import_errors.append(("Strategy 3", str(e3)))
+        print(f"✗ Strategy 3 failed: {e3}\n")
+
+# Strategy 3: Manual file loading using importlib
+if not import_success:
+    try:
+        print("Attempting Strategy 4: Manual file loading with importlib")
+        import importlib.util
         
-        # Strategy 3: Manual file imports
+        def load_module_from_file(module_name, file_path):
+            """Load a module from a file path."""
+            if not file_path.exists():
+                raise FileNotFoundError(f"Module file not found: {file_path}")
+            
+            spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not load spec for {module_name}")
+            
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            return module
+        
+        # Load each module
+        print(f"  Loading video_loader from {core_dir / 'video_loader.py'}")
+        video_loader_mod = load_module_from_file("video_loader", core_dir / "video_loader.py")
+        
+        print(f"  Loading selector from {core_dir / 'selector.py'}")
+        selector_mod = load_module_from_file("selector", core_dir / "selector.py")
+        
+        print(f"  Loading tracker from {core_dir / 'tracker.py'}")
+        tracker_mod = load_module_from_file("tracker", core_dir / "tracker.py")
+        
+        print(f"  Loading presence_zones from {core_dir / 'presence_zones.py'}")
+        presence_mod = load_module_from_file("presence_zones", core_dir / "presence_zones.py")
+        
+        print(f"  Loading behavioral_signals from {core_dir / 'behavioral_signals.py'}")
+        signals_mod = load_module_from_file("behavioral_signals", core_dir / "behavioral_signals.py")
+        
+        # Extract classes
+        VideoLoader = video_loader_mod.VideoLoader
+        quick_select_fighters = selector_mod.quick_select_fighters
+        FighterTracker = tracker_mod.FighterTracker
+        PresenceZoneTracker = presence_mod.PresenceZoneTracker
+        BehavioralSignalExtractor = signals_mod.BehavioralSignalExtractor
+        
+        print("✓ Strategy 4 successful!\n")
+        import_success = True
+    except Exception as e4:
+        import_errors.append(("Strategy 4", str(e4)))
+        print(f"✗ Strategy 4 failed: {e4}\n")
+
+# If all strategies failed, show detailed error information
+if not import_success:
+    print("\n" + "=" * 80)
+    print("❌ ALL IMPORT STRATEGIES FAILED")
+    print("=" * 80)
+    
+    for strategy_name, error in import_errors:
+        print(f"\n{strategy_name} error:")
+        print(f"  {error}")
+    
+    print("\n" + "-" * 80)
+    print("DIAGNOSTIC INFORMATION:")
+    print("-" * 80)
+    
+    print(f"\nProject structure check:")
+    print(f"  Project root exists: {project_root.exists()}")
+    print(f"  Core directory exists: {core_dir.exists()}")
+    
+    if core_dir.exists():
+        print(f"\n  Files in core directory:")
         try:
-            import importlib.util
-            
-            def load_module_from_file(module_name, file_path):
-                spec = importlib.util.spec_from_file_location(module_name, file_path)
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
-                return module
-            
-            # Load each module
-            video_loader_mod = load_module_from_file("video_loader", core_dir / "video_loader.py")
-            selector_mod = load_module_from_file("selector", core_dir / "selector.py")
-            tracker_mod = load_module_from_file("tracker", core_dir / "tracker.py")
-            presence_mod = load_module_from_file("presence_zones", core_dir / "presence_zones.py")
-            
-            VideoLoader = video_loader_mod.VideoLoader
-            quick_select_fighters = selector_mod.quick_select_fighters
-            FighterTracker = tracker_mod.FighterTracker
-            PresenceZoneTracker = presence_mod.PresenceZoneTracker
-            
-            print("✓ Imports successful using: manual file loading\n")
-        except Exception as e3:
-            print("\n" + "=" * 80)
-            print("❌ ALL IMPORT STRATEGIES FAILED")
-            print("=" * 80)
-            print(f"\nStrategy 1 error: {e1}")
-            print(f"Strategy 2 error: {e2}")
-            print(f"Strategy 3 error: {e3}")
-            print("\nPlease verify these files exist:")
-            print(f"  {core_dir / 'video_loader.py'}")
-            print(f"  {core_dir / 'selector.py'}")
-            print(f"  {core_dir / 'tracker.py'}")
-            print(f"  {core_dir / 'presence_zones.py'}")
-            print("\nFiles found in core/:")
-            try:
-                for f in core_dir.glob("*.py"):
-                    print(f"  - {f.name}")
-            except:
-                print("  (could not list files)")
-            print("=" * 80 + "\n")
-            sys.exit(1)
+            for f in sorted(core_dir.glob("*.py")):
+                print(f"    ✓ {f.name}")
+        except Exception as e:
+            print(f"    ✗ Could not list files: {e}")
+    else:
+        print(f"\n  ✗ Core directory not found at: {core_dir}")
+        print(f"  Looking for app/core/ structure...")
+        
+        # Check alternative structures
+        app_dir = project_root / "app"
+        if app_dir.exists():
+            print(f"    ✓ Found app/ directory")
+            for item in app_dir.iterdir():
+                print(f"      - {item.name}")
+        else:
+            print(f"    ✗ No app/ directory found")
+    
+    print(f"\n  Required files:")
+    required_files = [
+        "video_loader.py",
+        "selector.py", 
+        "tracker.py",
+        "presence_zones.py",
+        "behavioral_signals.py"
+    ]
+    
+    for filename in required_files:
+        filepath = core_dir / filename
+        exists = "✓" if filepath.exists() else "✗"
+        print(f"    {exists} {filename}")
+    
+    print("\n" + "=" * 80)
+    print("RECOMMENDED ACTIONS:")
+    print("=" * 80)
+    print("1. Verify you're running from the project root directory:")
+    print(f"   cd {project_root}")
+    print("2. Ensure the project structure is:")
+    print("   mma_fighter_analysis/")
+    print("   ├── app/")
+    print("   │   └── core/")
+    print("   │       ├── video_loader.py")
+    print("   │       ├── selector.py")
+    print("   │       ├── tracker.py")
+    print("   │       ├── presence_zones.py")
+    print("   │       └── behavioral_signals.py")
+    print("   └── tests/")
+    print("       └── test_signals.py")
+    print("3. Check file permissions and ensure files are readable")
+    print("=" * 80 + "\n")
+    
+    sys.exit(1)
 
 # Verify all imports succeeded
-if not all([VideoLoader, quick_select_fighters, FighterTracker, PresenceZoneTracker]):
-    print("❌ Some imports are None - this should not happen!")
+if not all([VideoLoader, quick_select_fighters, FighterTracker, PresenceZoneTracker, BehavioralSignalExtractor]):
+    print("=" * 80)
+    print("❌ IMPORT VERIFICATION FAILED")
+    print("=" * 80)
+    print("Some imports are None after successful strategy!")
+    print(f"  VideoLoader: {VideoLoader is not None}")
+    print(f"  quick_select_fighters: {quick_select_fighters is not None}")
+    print(f"  FighterTracker: {FighterTracker is not None}")
+    print(f"  PresenceZoneTracker: {PresenceZoneTracker is not None}")
+    print(f"  BehavioralSignalExtractor: {BehavioralSignalExtractor is not None}")
+    print("=" * 80 + "\n")
     sys.exit(1)
+
+print("=" * 80)
+print("✓ ALL MODULES IMPORTED SUCCESSFULLY")
+print("=" * 80 + "\n")
 
 
 def run_pipeline(video_path_str: str, output_folder: str = "output", playback_speed: float = 1.0):
@@ -203,7 +331,7 @@ def run_pipeline(video_path_str: str, output_folder: str = "output", playback_sp
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 3: Initialize Trackers
     # ═══════════════════════════════════════════════════════════════════════
-    print("→ STEP 3: Initializing trackers...")
+    print("→ STEP 3: Initializing trackers and signal extractors...")
     
     tracker = FighterTracker(
         frame_width=info['width'],
@@ -215,7 +343,13 @@ def run_pipeline(video_path_str: str, output_folder: str = "output", playback_sp
     presence = PresenceZoneTracker(
         fps=info['fps'],
         merge_gap_seconds=1.5,
-        presence_threshold=0.6  # Fix 6: Stricter threshold for presence JSON
+        presence_threshold=0.6
+    )
+    
+    signals = BehavioralSignalExtractor(
+        frame_width=info['width'],
+        frame_height=info['height'],
+        fps=info['fps']
     )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -227,7 +361,7 @@ def run_pipeline(video_path_str: str, output_folder: str = "output", playback_sp
     loader.reset()
     frame_idx = 0
     total = info['total_frames']
-    progress_interval = max(1, total // 50)  # Show ~50 progress updates
+    progress_interval = max(1, total // 50)
 
     try:
         while frame_idx < total:
@@ -236,21 +370,22 @@ def run_pipeline(video_path_str: str, output_folder: str = "output", playback_sp
                 print(f"\n⚠️  Warning: frame {frame_idx} could not be read")
                 break
 
-            # Update trackers
+            # Update trackers and signal extractor
             tracker.update(frame)
             status = tracker.get_status()
             presence.update(status)
+            signals.update(status)
 
             # Draw bounding boxes on frame for visualization
             display_frame = frame.copy()
             if status['my_fighter']['bbox'] is not None:
                 x, y, w, h = status['my_fighter']['bbox']
-                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)  # Red for my fighter
+                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
                 cv2.putText(display_frame, "MY FIGHTER", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             
             if status['opponent']['bbox'] is not None:
                 x, y, w, h = status['opponent']['bbox']
-                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)  # Blue for opponent
+                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
                 cv2.putText(display_frame, "OPPONENT", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
             # Add status info
@@ -258,13 +393,12 @@ def run_pipeline(video_path_str: str, output_folder: str = "output", playback_sp
             cv2.putText(display_frame, f"My: {'✓' if status['my_fighter']['reliable'] else '✗'} Opp: {'✓' if status['opponent']['reliable'] else '✗'}", 
                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # Resize frame for better display (maintain aspect ratio)
+            # Resize frame for better display
             height, width = display_frame.shape[:2]
             max_display_width = 1280
             max_display_height = 720
             
             if width > max_display_width or height > max_display_height:
-                # Calculate scaling factor to fit within max dimensions
                 scale_w = max_display_width / width
                 scale_h = max_display_height / height
                 scale = min(scale_w, scale_h)
@@ -277,13 +411,13 @@ def run_pipeline(video_path_str: str, output_folder: str = "output", playback_sp
             # Show the frame
             cv2.imshow('MMA Fighter Tracking', display_frame)
             
-            # Check for quit key (with adjustable delay for video playback)
+            # Check for quit key
             if playback_speed == 0:
-                delay_ms = 1  # Max speed
+                delay_ms = 1
             else:
-                delay_ms = int(30 / playback_speed)  # Scale delay by speed factor
+                delay_ms = int(30 / playback_speed)
             
-            key = cv2.waitKey(max(1, delay_ms)) & 0xFF  # Minimum 1ms delay
+            key = cv2.waitKey(max(1, delay_ms)) & 0xFF
             if key == ord('q'):
                 print("\n\n⚠️  Processing stopped by user (Q key)")
                 break
@@ -313,19 +447,25 @@ def run_pipeline(video_path_str: str, output_folder: str = "output", playback_sp
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 5: Finalize and Display Results
     # ═══════════════════════════════════════════════════════════════════════
-    print("\n→ STEP 5: Finalizing presence zones...")
+    print("\n→ STEP 5: Finalizing results...")
     presence.finalize()
+    signals.finalize()
+    
+    # Display summaries
     presence.print_summary()
+    signals.print_summary()
 
     # Export results
-    json_path = output_dir / f"{video_id}_presence_zones.json"
-    presence.export_json(video_id, str(json_path), include_metadata=True)
+    presence_json_path = output_dir / f"{video_id}_presence_zones.json"
+    presence.export_json(video_id, str(presence_json_path), include_metadata=True)
     
-    print(f"\n📁 Results saved to: {json_path}")
+    signals_json_path = output_dir / f"{video_id}_behavioral_signals.json"
+    signals.export_json(video_id, str(signals_json_path), include_metadata=True)
+    
+    print(f"\n📁 Results saved:")
+    print(f"   • Presence zones:      {presence_json_path}")
+    print(f"   • Behavioral signals:  {signals_json_path}")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Cleanup
-    # ═══════════════════════════════════════════════════════════════════════
     print("\n" + "═" * 80)
     print(" PIPELINE COMPLETED SUCCESSFULLY ✓ ")
     print("═" * 80 + "\n")
@@ -348,7 +488,7 @@ def main():
         print("  python tests/test_signals.py Videos/VED.mp4 output 1.0    # Normal speed")
         print("  python tests/test_signals.py Videos/VED.mp4 output 2.0    # 2x speed")
         print("  python tests/test_signals.py Videos/VED.mp4 output 0.5    # Half speed")
-        print("  python tests/test_signals.py Videos/VED.mp4 output 0      # Max speed (no delay)")
+        print("  python tests/test_signals.py Videos/VED.mp4 output 0      # Max speed")
         print("\nWith full path:")
         print("  python tests/test_signals.py C:/path/to/video.mp4")
         print("\n" + "═" * 80 + "\n")
@@ -357,13 +497,12 @@ def main():
     video_arg = sys.argv[1]
     output_arg = sys.argv[2] if len(sys.argv) >= 3 else "output"
     
-    # Parse speed argument (default 1.0 = normal speed)
     speed_arg = 1.0
     if len(sys.argv) >= 4:
         try:
             speed_arg = float(sys.argv[3])
             if speed_arg < 0:
-                speed_arg = 0  # Max speed
+                speed_arg = 0
         except ValueError:
             print(f"Warning: Invalid speed '{sys.argv[3]}', using default 1.0")
             speed_arg = 1.0
