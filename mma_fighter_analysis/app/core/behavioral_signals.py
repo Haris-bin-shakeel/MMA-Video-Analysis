@@ -1,19 +1,3 @@
-"""
-Behavioral Signal Extraction for MMA Fighter Analysis
-Extracts movement and positional signals from bounding box tracking data.
-
-Signals Generated (per second):
-- distance_delta: Change in distance between fighters
-- forward_velocity: Forward/backward movement of selected fighter
-- lateral_displacement: Sideways movement
-- vertical_level_change: Change in vertical bbox center
-- contact_duration: Time spent within clinch threshold
-- control_overlap: % of bounding box overlap
-- recovery_latency: Time until motion stabilizes
-- scramble_entropy: Degree of chaotic movement
-
-All values are normalized/relative (no real-world units).
-"""
 
 import numpy as np
 from typing import Dict, List, Optional, Tuple
