@@ -1,26 +1,3 @@
-"""
-Robust MMA Fighter Tracker
-Handles clinches, grappling, occlusions, overlaps, and identity preservation.
-Uses multiple tracking strategies with fallback mechanisms.
-
-FIXES APPLIED:
-- State machine (VISIBLE, TEMP_LOST, LOST_CONFIRMED)
-- Confidence + source tracking
-- CSRT reinit only when needed
-- Clinch locking
-- Camera motion compensation
-- Presence alignment hooks
-
-ADDITIONAL FIXES (from remaining list):
-1. Frozen fighter confidence decay
-2. LOST_CONFIRMED fighters don't block opponent re-detection
-3. Identity swap disabled during clinch
-4. Presence gap start frame corrected
-5. CSRT tracker cleared when LOST_CONFIRMED
-6. Global camera motion sanity check
-7. History pollution prevention during TEMP_LOST
-8. bbox_validity_score (optional recommendation)
-"""
 
 import cv2
 import numpy as np
@@ -31,7 +8,7 @@ from enum import Enum
 class FighterState(Enum):
     """Fighter tracking state."""
     VISIBLE = "visible"
-    OCCLUDED = "occluded"  # Issue 6: Fighter visible but bbox confused during overlap
+    OCCLUDED = "occluded"  
     TEMP_LOST = "temp_lost"
     LOST_CONFIRMED = "lost_confirmed"
 
@@ -46,21 +23,7 @@ class TrackingSource(Enum):
 
 
 class FighterTracker:
-    """
-    Deterministic tracker for two MMA fighters with identity preservation.
-    
-    Multi-Strategy Tracking:
-    1. CSRT Tracker (primary) - Accurate long-term tracking
-    2. Optical Flow (secondary) - Motion estimation
-    3. Color Histogram (tertiary) - Appearance-based re-detection
-    4. Motion Prediction (fallback) - Extrapolate from history
-    
-    Identity Preservation:
-    - Spatial consistency: Fighters maintain relative positions
-    - Appearance memory: Store color histograms
-    - Motion constraints: Max plausible displacement
-    - Overlap handling: Use trajectory history during clinches
-    """
+   
     
     # === CONFIGURABLE THRESHOLDS ===
     MAX_DISPLACEMENT_RATIO = 0.25  # Max movement as fraction of frame diagonal
