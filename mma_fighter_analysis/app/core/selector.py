@@ -1,9 +1,4 @@
-"""
-Manual Fighter Selection Module
-Allows user to manually select fighters by drawing bounding boxes.
-After selection, user confirms which fighter is theirs.
-NO machine learning. NO automation. User decides.
-"""
+
 
 import cv2
 import numpy as np
@@ -11,40 +6,24 @@ from typing import List, Tuple, Optional, Dict
 
 
 class FighterSelector:
-    """
-    Interactive bounding box selector for manual fighter identification.
-    
-    How it works:
-    1. Display first frame
-    2. User clicks and drags to draw rectangle around Fighter 1
-    3. Press SPACE to confirm
-    4. User draws rectangle around Fighter 2
-    5. Press SPACE to confirm
-    6. User selects which fighter is THEIRS (press 1 or 2)
-    7. Returns role-labeled bounding boxes
-    """
+   
     
     def __init__(self, frame: np.ndarray):
-        """
-        Initialize selector with first frame.
-        
-        Args:
-            frame: First frame of video (BGR numpy array)
-        """
+       
         self.original_frame = frame.copy()
         self.display_frame = frame.copy()
         self.bboxes = []  # List of selected bounding boxes
         
-        # Drawing state
+       
         self.drawing = False
         self.start_point = None
         self.current_point = None
         self.temp_bbox = None
         
-        # Window name
+       
         self.window_name = "MMA Fighter Selection"
         
-        # Colors
+        
         self.color_drawing = (255, 0, 0)      # Blue while drawing
         self.color_confirmed = (0, 255, 0)    # Green when confirmed
         self.color_my_fighter = (0, 0, 255)   # Red for my fighter
@@ -52,20 +31,7 @@ class FighterSelector:
         self.color_text = (255, 255, 255)     # White text
         
     def select_fighters(self, num_fighters: int = 2) -> Dict[str, Tuple[int, int, int, int]]:
-        """
-        Interactive selection of fighters with role confirmation.
         
-        Args:
-            num_fighters: Number of fighters to select (default: 2)
-            
-        Returns:
-            Dictionary with role-labeled bounding boxes:
-            {
-                "my_fighter": (x, y, w, h),
-                "opponent": (x, y, w, h)
-            }
-        """
-        # Step 1: Draw bounding boxes
         self._draw_bounding_boxes(num_fighters)
         
         # Step 2: Confirm roles
@@ -82,7 +48,7 @@ class FighterSelector:
             raise ValueError("No fighters selected!")
     
     def _draw_bounding_boxes(self, num_fighters: int):
-        """Draw bounding boxes for fighters."""
+       
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window_name, 1280, 720)
         cv2.setMouseCallback(self.window_name, self._mouse_callback)
@@ -100,47 +66,47 @@ class FighterSelector:
         print("=" * 60 + "\n")
         
         while len(self.bboxes) < num_fighters:
-            # Prepare display
+            
             display = self.original_frame.copy()
             
-            # Draw confirmed bboxes
+           
             for idx, bbox in enumerate(self.bboxes):
                 x, y, w, h = bbox
                 cv2.rectangle(display, (x, y), (x + w, y + h), 
                             self.color_confirmed, 3)
                 
-                # Label
+               
                 label = f"Fighter {idx + 1}"
                 cv2.putText(display, label, (x, y - 10),
                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, 
                           self.color_confirmed, 2)
             
-            # Draw current bbox being drawn
+            
             if self.drawing and self.start_point and self.current_point:
                 x1, y1 = self.start_point
                 x2, y2 = self.current_point
                 cv2.rectangle(display, (x1, y1), (x2, y2), 
                             self.color_drawing, 2)
             
-            # Draw temporary confirmed bbox (before SPACE pressed)
+           
             elif self.temp_bbox is not None:
                 x, y, w, h = self.temp_bbox
                 cv2.rectangle(display, (x, y), (x + w, y + h), 
                             self.color_drawing, 2)
                 
-                # Instruction
+                
                 cv2.putText(display, "Press SPACE to confirm", 
                           (x, y - 10),
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
                           self.color_drawing, 2)
             
-            # Status text
+          
             status = f"Selected: {len(self.bboxes)}/{num_fighters}"
             cv2.putText(display, status, (20, 40),
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, 
                        self.color_text, 2)
             
-            # Instructions on frame
+           
             instructions = [
                 "Click & Drag: Draw box",
                 "SPACE: Confirm",
@@ -154,10 +120,10 @@ class FighterSelector:
                           self.color_text, 1)
                 y_offset += 25
             
-            # Show frame
+           
             cv2.imshow(self.window_name, display)
             
-            # Handle keyboard
+            
             key = cv2.waitKey(1) & 0xFF
             
             if key == 27:  # ESC
@@ -185,12 +151,7 @@ class FighterSelector:
                 self.current_point = None
     
     def _confirm_fighter_roles(self) -> Dict[str, Tuple[int, int, int, int]]:
-        """
-        Ask user to confirm which fighter is theirs.
-        
-        Returns:
-            Dictionary with role-labeled bounding boxes
-        """
+       
         print("\n" + "=" * 60)
         print("🥊 STEP 2: CONFIRM FIGHTER ROLES")
         print("=" * 60)
@@ -257,20 +218,20 @@ class FighterSelector:
                 cv2.destroyWindow(self.window_name)
                 raise ValueError("Role selection cancelled by user")
         
-        # Show final confirmation with colors
+       
         self._show_final_confirmation(my_fighter_idx)
         
         cv2.destroyWindow(self.window_name)
         
-        # Build result
-        opponent_idx = 1 - my_fighter_idx  # If my=0, opponent=1; if my=1, opponent=0
+        
+        opponent_idx = 1 - my_fighter_idx  
         
         result = {
             "my_fighter": self.bboxes[my_fighter_idx],
             "opponent": self.bboxes[opponent_idx]
         }
         
-        # Print final confirmation
+       
         print("\n" + "=" * 60)
         print("✅ FIGHTER ROLES CONFIRMED")
         print("=" * 60)
@@ -283,7 +244,7 @@ class FighterSelector:
         return result
     
     def _show_final_confirmation(self, my_fighter_idx: int):
-        """Show final color-coded confirmation for 2 seconds."""
+        
         display = self.original_frame.copy()
         
         opponent_idx = 1 - my_fighter_idx
@@ -304,27 +265,19 @@ class FighterSelector:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, 
                    self.color_opponent, 3)
         
-        # Confirmation text
+       
         cv2.putText(display, "Roles Confirmed! Starting analysis...", 
                    (20, 40),
                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, 
                    (0, 255, 0), 2)
         
         cv2.imshow(self.window_name, display)
-        cv2.waitKey(2000)  # Show for 2 seconds
+        cv2.waitKey(2000)  
     
     def _mouse_callback(self, event, x, y, flags, param):
-        """
-        Handle mouse events for drawing rectangles.
-        
-        Args:
-            event: OpenCV mouse event type
-            x, y: Mouse coordinates
-            flags: Additional flags
-            param: Additional parameters
-        """
+       
         if event == cv2.EVENT_LBUTTONDOWN:
-            # Start drawing
+            
             self.drawing = True
             self.start_point = (x, y)
             self.current_point = (x, y)
@@ -332,7 +285,7 @@ class FighterSelector:
         
         elif event == cv2.EVENT_MOUSEMOVE:
             if self.drawing:
-                # Update current point
+                
                 self.current_point = (x, y)
         
         elif event == cv2.EVENT_LBUTTONUP:
@@ -343,13 +296,13 @@ class FighterSelector:
                 x1, y1 = self.start_point
                 x2, y2 = x, y
                 
-                # Calculate bbox (top-left corner + width/height)
+                
                 x_min = min(x1, x2)
                 y_min = min(y1, y2)
                 width = abs(x2 - x1)
                 height = abs(y2 - y1)
                 
-                # Validate bbox size (must be at least 10x10 pixels)
+               
                 if width > 10 and height > 10:
                     self.temp_bbox = (x_min, y_min, width, height)
                     print(f"📦 Box drawn: x={x_min}, y={y_min}, w={width}, h={height} (Press SPACE to confirm)")
@@ -362,19 +315,6 @@ class FighterSelector:
 
 
 def quick_select_fighters(frame: np.ndarray, num_fighters: int = 2) -> Dict[str, Tuple[int, int, int, int]]:
-    """
-    Convenience function for quick fighter selection with role confirmation.
-    
-    Args:
-        frame: First frame of video
-        num_fighters: Number of fighters to select (default: 2)
-        
-    Returns:
-        Dictionary with role-labeled bounding boxes:
-        {
-            "my_fighter": (x, y, w, h),
-            "opponent": (x, y, w, h)
-        }
-    """
+   
     selector = FighterSelector(frame)
     return selector.select_fighters(num_fighters)
