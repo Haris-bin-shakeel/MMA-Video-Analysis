@@ -1,27 +1,3 @@
-"""
-Robust MMA Fighter Tracker
-Handles clinches, grappling, occlusions, overlaps, and identity preservation.
-Uses multiple tracking strategies with fallback mechanisms.
-
-FIXES APPLIED:
-- State machine (VISIBLE, TEMP_LOST, LOST_CONFIRMED)
-- Confidence + source tracking
-- CSRT reinit only when needed
-- Clinch locking
-- Camera motion compensation
-- Presence alignment hooks
-
-ADDITIONAL FIXES (from remaining list):
-1. Frozen fighter confidence decay
-2. LOST_CONFIRMED fighters don't block opponent re-detection
-3. Identity swap disabled during clinch
-4. Presence gap start frame corrected
-5. CSRT tracker cleared when LOST_CONFIRMED
-6. Global camera motion sanity check
-7. History pollution prevention during TEMP_LOST
-8. bbox_validity_score (optional recommendation)
-"""
-
 import cv2
 import numpy as np
 from typing import Optional, Tuple, Dict, List
@@ -31,7 +7,7 @@ from enum import Enum
 class FighterState(Enum):
     """Fighter tracking state."""
     VISIBLE = "visible"
-    OCCLUDED = "occluded"  # Issue 6: Fighter visible but bbox confused during overlap
+    OCCLUDED = "occluded"  
     TEMP_LOST = "temp_lost"
     LOST_CONFIRMED = "lost_confirmed"
 
@@ -46,50 +22,40 @@ class TrackingSource(Enum):
 
 
 class FighterTracker:
-    """
-    Deterministic tracker for two MMA fighters with identity preservation.
+   
     
-    Multi-Strategy Tracking:
-    1. CSRT Tracker (primary) - Accurate long-term tracking
-    2. Optical Flow (secondary) - Motion estimation
-    3. Color Histogram (tertiary) - Appearance-based re-detection
-    4. Motion Prediction (fallback) - Extrapolate from history
+    MAX_DISPLACEMENT_RATIO = 0.25  
+    MIN_BOX_SIZE = 30  
+    MAX_SIZE_CHANGE_RATIO = 2.5  
+    LOST_FRAME_THRESHOLD = 60 
+    REAPPEAR_SEARCH_RADIUS_RATIO = 0.35  
+    OVERLAP_IOU_THRESHOLD = 0.4  
+    CLINCH_IOU_THRESHOLD = 0.7
+    CLINCH_EXIT_IOU = 0.5
+    HISTOGRAM_MATCH_THRESHOLD = 0.6  
+    TRACKING_QUALITY_THRESHOLD = 3.0
+    VALIDITY_THRESHOLD = 0.4  
+    VISIBILITY_THRESHOLD = 0.5
+    PRESENCE_THRESHOLD = 0.6  
     
-    Identity Preservation:
-    - Spatial consistency: Fighters maintain relative positions
-    - Appearance memory: Store color histograms
-    - Motion constraints: Max plausible displacement
-    - Overlap handling: Use trajectory history during clinches
-    """
+    GROUND_MODE_Y_THRESHOLD = 0.7  
+    GROUND_MODE_DURATION = 90  
+    SCENE_CHANGE_THRESHOLD = 0.6  
+    SINGLE_FIGHTER_MAX_SIZE_RATIO = 0.9  
+    CAGE_EDGE_MARGIN = 50  
+    TAKEDOWN_VELOCITY_THRESHOLD = 15  
+    REENTRY_SEARCH_INTERVAL = 30  
+    ADAPTIVE_DISPLACEMENT_FACTOR = 1.5 
+    PARTIAL_FRAME_MARGIN = 100  
+    HISTOGRAM_BLEND_RATE = 0.1  
+    REFEREE_SIZE_RATIO = 0.3
+    REFEREE_MOTION_FACTOR = 2.0
     
-    # === CONFIGURABLE THRESHOLDS ===
-    MAX_DISPLACEMENT_RATIO = 0.25  # Max movement as fraction of frame diagonal
-    MIN_BOX_SIZE = 30  # Minimum width/height in pixels
-    MAX_SIZE_CHANGE_RATIO = 2.5  # Max size change between frames
-    LOST_FRAME_THRESHOLD = 60  # Frames before considering truly lost (2 sec at 30fps)
-    REAPPEAR_SEARCH_RADIUS_RATIO = 0.35  # Search radius for re-detection
-    OVERLAP_IOU_THRESHOLD = 0.4  # IOU threshold for overlap detection
-    CLINCH_IOU_THRESHOLD = 0.7  # IOU threshold for clinch lock
-    CLINCH_EXIT_IOU = 0.5  # FIX #2: Hysteresis for clinch exit
-    HISTOGRAM_MATCH_THRESHOLD = 0.6  # Color similarity threshold
-    TRACKING_QUALITY_THRESHOLD = 3.0  # Min quality for CSRT tracker
-    VALIDITY_THRESHOLD = 0.4  # FIX #5: Minimum validity for reliable presence
-    VISIBILITY_THRESHOLD = 0.5  # Fix 3: Minimum confidence for bbox visibility
-    PRESENCE_THRESHOLD = 0.6  # Fix 6: Minimum confidence for presence JSON (stricter than visibility)
-    
-    # === NEW THRESHOLDS FOR ADDITIONAL ROBUSTNESS ===
-    GROUND_MODE_Y_THRESHOLD = 0.7  # Y-coordinate ratio for ground mode detection
-    GROUND_MODE_DURATION = 90  # Frames (3 sec) for ground mode activation
-    SCENE_CHANGE_THRESHOLD = 0.6  # Histogram difference for scene change detection
-    SINGLE_FIGHTER_MAX_SIZE_RATIO = 0.9  # Allow larger bboxes when only one fighter visible
-    CAGE_EDGE_MARGIN = 50  # Pixels from edge to consider "near cage"
-    TAKEDOWN_VELOCITY_THRESHOLD = 15  # Pixels/frame downward velocity for takedown detection
-    REENTRY_SEARCH_INTERVAL = 30  # Frames between full-frame searches when LOST_CONFIRMED
-    ADAPTIVE_DISPLACEMENT_FACTOR = 1.5  # Multiplier for recent high-velocity fighters
-    PARTIAL_FRAME_MARGIN = 100  # Pixels outside frame allowed for partial visibility
-    HISTOGRAM_BLEND_RATE = 0.1  # Gradual blend rate for post-clinch histogram recovery
-    REFEREE_SIZE_RATIO = 0.3  # Min size ratio vs fighters to consider as referee
-    REFEREE_MOTION_FACTOR = 2.0  # Motion multiplier vs fighters for referee detection
+    # Identity Guard Constants
+    MAX_CENTROID_JUMP_RATIO = 0.25  # 25% of frame diagonal max jump
+    GUARD_IOU_THRESHOLD = 0.5  # Reject if IoU exceeds this (more conservative than OVERLAP_IOU_THRESHOLD)
+    GROUND_LOCK_HEIGHT_RATIO = 0.75  # 75% down frame = ground level
+    GROUND_LOCK_JUMP_REDUCTION = 0.6  # Reduce jump threshold by 40% when in ground position
     
     def __init__(self, frame_width: int, frame_height: int, fps: float):
         """Initialize tracker with video properties."""
@@ -97,37 +63,33 @@ class FighterTracker:
         self.frame_height = frame_height
         self.fps = fps
         
-        # Calculate max displacement
         frame_diagonal = np.sqrt(frame_width**2 + frame_height**2)
         self.max_displacement = frame_diagonal * self.MAX_DISPLACEMENT_RATIO
         self.reappear_search_radius = frame_diagonal * self.REAPPEAR_SEARCH_RADIUS_RATIO
         
-        # CSRT Trackers (only reinit when needed)
+        # Identity Guard thresholds (frame-size aware)
+        self.max_centroid_jump = frame_diagonal * self.MAX_CENTROID_JUMP_RATIO
+        self.ground_lock_y = frame_height * self.GROUND_LOCK_HEIGHT_RATIO
+        
         self.my_tracker = None
         self.opponent_tracker = None
         
-        # Current state
         self.my_fighter_bbox = None
         self.opponent_bbox = None
         
-        # Fighter states
         self.my_fighter_state = FighterState.LOST_CONFIRMED
         self.opponent_state = FighterState.LOST_CONFIRMED
         
-        # Tracking source
         self.my_fighter_source = None
         self.opponent_source = None
         
-        # Confidence
         self.my_fighter_confidence = 0.0
         self.opponent_confidence = 0.0
         
-        # FIX #8: Validity score
         self.my_fighter_validity = 0.0
         self.opponent_validity = 0.0
         
-        # History for trajectory prediction
-        self.my_fighter_history = []  # List of (center_x, center_y, width, height, frame)
+        self.my_fighter_history = []  
         self.opponent_history = []
         
         # Lost frame counters
@@ -157,49 +119,37 @@ class FighterTracker:
         self.clinch_frozen_fighter = None  # 'my' or 'opponent'
         self.clinch_start_frame = None  # FIX #1: Track clinch duration
         
-        # Pre-clinch backups (Issue 3)
         self.my_fighter_histogram_backup = None
         self.opponent_histogram_backup = None
         self.my_fighter_pre_clinch_pos = None
         self.opponent_pre_clinch_pos = None
         
-        # Issue 6: Separation cooldown to prevent immediate re-occlusion
         self.separation_cooldown = 0
         
-        # === NEW INSTANCE VARIABLES FOR ENHANCED ROBUSTNESS ===
-        # Ground mode detection
         self.ground_mode_active = False
         self.ground_mode_start_frame = None
         
-        # Scene change detection
         self.prev_frame_histogram = None
         self.scene_change_detected = False
         
-        # Adaptive displacement tracking
         self.my_fighter_recent_velocity = 0.0
         self.opponent_recent_velocity = 0.0
         
-        # Re-entry search counters
         self.my_fighter_reentry_search_counter = 0
         self.opponent_reentry_search_counter = 0
         
-        # Takedown detection
         self.takedown_in_progress = False
         self.takedown_start_frame = None
         
-        # Referee detection
         self.potential_referee_bbox = None
         self.referee_detection_cooldown = 0
         
-        # Texture features for appearance matching (Issue 9)
         self.my_fighter_texture_features = None
         self.opponent_texture_features = None
         
-        # Separation detection (Issue 2)
         self.prev_iou = 0.0
         self.separation_cooldown_frames = 0
         
-        # History duration in seconds
         self.history_duration_seconds = 2.0
         self.max_history_frames = int(self.history_duration_seconds * fps)
         
@@ -214,39 +164,32 @@ class FighterTracker:
         self.my_fighter_bbox = my_fighter_bbox
         self.opponent_bbox = opponent_bbox
         
-        # Initialize CSRT trackers
         self.my_tracker = cv2.TrackerCSRT_create()
         self.opponent_tracker = cv2.TrackerCSRT_create()
         
         self.my_tracker.init(frame, my_fighter_bbox)
         self.opponent_tracker.init(frame, opponent_bbox)
         
-        # Store initial states
         self.my_fighter_last_valid = my_fighter_bbox
         self.opponent_last_valid = opponent_bbox
         
-        # Set states
         self.my_fighter_state = FighterState.VISIBLE
         self.opponent_state = FighterState.VISIBLE
         
-        # Set sources and confidence
         self.my_fighter_source = TrackingSource.CSRT
         self.opponent_source = TrackingSource.CSRT
         self.my_fighter_confidence = 1.0
         self.opponent_confidence = 1.0
         
-        # FIX #8: Initialize validity scores
         self.my_fighter_validity = 1.0
         self.opponent_validity = 1.0
         
-        # Initialize history
         cx, cy = self._bbox_center(my_fighter_bbox)
         self.my_fighter_history.append((cx, cy, my_fighter_bbox[2], my_fighter_bbox[3], 0))
         
         cx, cy = self._bbox_center(opponent_bbox)
         self.opponent_history.append((cx, cy, opponent_bbox[2], opponent_bbox[3], 0))
         
-        # Build appearance models
         self.my_fighter_histogram = self._compute_histogram(frame, my_fighter_bbox)
         self.opponent_histogram = self._compute_histogram(frame, opponent_bbox)
         
@@ -261,68 +204,44 @@ class FighterTracker:
         print("✅ Tracker initialized with CSRT trackers")
     
     def update(self, frame: np.ndarray) -> Dict[str, Optional[Tuple[int, int, int, int]]]:
-        """
-        Update tracker with new frame using multi-strategy approach.
         
-        Tracking Priority:
-        1. Check for clinch mode
-        2. CSRT tracker (primary)
-        3. Validate with motion constraints
-        4. Check for identity swaps
-        5. Fallback to optical flow if CSRT fails
-        6. Fallback to color-based search if both fail
-        7. Use motion prediction as last resort (if not truly lost)
-        """
         self.frame_count += 1
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # === NEW FEATURES: Enhanced Robustness ===
         
-        # Issue 3: Detect scene changes (camera cuts/zooms)
         self._detect_scene_change(frame)
         
-        # Issue 2: Detect ground fighting mode
         ground_mode = self._detect_ground_mode(self.my_fighter_bbox, self.opponent_bbox)
         
-        # Issue 7: Detect potential referees
         motion_frame = cv2.absdiff(gray, self.prev_gray) if self.prev_gray is not None else gray
         self._detect_potential_referee(frame, motion_frame)
         
-        # FIX #6: Camera motion compensation with sanity check
         global_motion = self._estimate_global_motion(self.prev_gray, gray) if self.prev_gray is not None else (0, 0)
         
-        # FIX #6: Disable global motion if too large (indicates fighter-dominated frame)
         if np.linalg.norm(global_motion) > self.max_displacement * 0.5:
             global_motion = (0, 0)
         
-        # FIX #2: CHECK CLINCH MODE (with hysteresis)
         if self.my_fighter_bbox and self.opponent_bbox:
             iou = self._calculate_iou(self.my_fighter_bbox, self.opponent_bbox)
             
-            # Issue 6: OCCLUDED state detection - high overlap indicates occlusion
             if iou > 0.7:
-                # Fighters are heavily overlapped/occluded
                 if self.my_fighter_state == FighterState.VISIBLE:
                     self.my_fighter_state = FighterState.OCCLUDED
                 if self.opponent_state == FighterState.VISIBLE:
                     self.opponent_state = FighterState.OCCLUDED
             
             if self.in_clinch:
-                # Exit clinch with lower threshold (hysteresis)
                 if iou < self.CLINCH_EXIT_IOU:
                     self.in_clinch = False
                     self.clinch_frozen_fighter = None
                     self.clinch_start_frame = None
                     
-                    # Issue 12: Reset frozen fighter confidence immediately upon clinch exit
                     self._reset_frozen_fighter_confidence()
                     
-                    # Issue 2 & 3: Force CSRT reinit and restore pre-clinch histograms on separation
                     force_reinit_my = True
                     force_reinit_opp = True
                     self.separation_cooldown_frames = 10  # Issue 4: Disable swap check for 10 frames
                     
-                    # Issue 11: Gradual histogram blend instead of instant restore
                     if self.my_fighter_histogram_backup is not None:
                         self.my_fighter_histogram = self._blend_histogram_after_clinch(
                             self.my_fighter_histogram, self.my_fighter_histogram_backup)
@@ -335,7 +254,6 @@ class FighterTracker:
                     self.in_clinch = True
                     self.clinch_start_frame = self.frame_count
                     
-                    # Issue 3: Backup current histograms before they get polluted
                     if self.my_fighter_histogram is not None:
                         self.my_fighter_histogram_backup = self.my_fighter_histogram.copy()
                     if self.opponent_histogram is not None:
@@ -352,9 +270,7 @@ class FighterTracker:
                     else:
                         self.clinch_frozen_fighter = 'opponent'
             
-            # Issue 2: Separation event detection (rapid IOU drop)
             if self.prev_iou > 0.7 and iou < 0.3:
-                # Rapid separation detected - force re-search with clean histograms
                 force_reinit_my = True
                 force_reinit_opp = True
                 self.separation_cooldown_frames = 10
@@ -383,7 +299,7 @@ class FighterTracker:
             clinch_duration=clinch_duration  # FIX #1: Pass duration
         )
         
-        # === TRACK OPPONENT ===
+        
         opponent_bbox, opp_source, opp_conf = self._track_fighter(
             frame, gray, global_motion,
             self.opponent_tracker,
@@ -396,13 +312,14 @@ class FighterTracker:
             clinch_duration=clinch_duration  # FIX #1: Pass duration
         )
         
-        # FIX #3: CHECK FOR IDENTITY SWAP (disabled during clinch and separation cooldown)
+        # === IDENTITY GUARD: Always-on lightweight protection ===
+        my_bbox, opponent_bbox = self._apply_identity_guard(my_bbox, opponent_bbox)
+        
         if (not self.in_clinch and 
             self.separation_cooldown_frames == 0 and  # Issue 4: Disable during separation
             my_bbox is not None and opponent_bbox is not None):
             my_bbox, opponent_bbox = self._prevent_identity_swap(my_bbox, opponent_bbox)
         
-        # === UPDATE MY FIGHTER STATE ===
         reinit_my = False
         
         if my_bbox is not None:
@@ -419,7 +336,6 @@ class FighterTracker:
                 my_bbox, prev_last, my_conf, my_source
             )
             
-            # ENFORCE CORNER STUCK KILL SWITCH
             if self._is_corner_stuck(self.my_fighter_bbox, self.my_fighter_history):
                 self.my_fighter_bbox = None
                 self.my_fighter_state = FighterState.TEMP_LOST
@@ -434,19 +350,15 @@ class FighterTracker:
                 self.my_fighter_lost_count = 0
                 self.my_fighter_lost_since = None
                 
-                # FIX #7: Only append history for reliable sources
                 if my_source in {TrackingSource.CSRT, TrackingSource.FLOW, TrackingSource.HIST}:
                     cx, cy = self._bbox_center(my_bbox)
                     self.my_fighter_history.append((cx, cy, my_bbox[2], my_bbox[3], self.frame_count))
                 
-                # Only reinitialize CSRT when needed
                 if my_source != TrackingSource.CSRT or prev_state != FighterState.VISIBLE:
                     reinit_my = True
                 
-                # Update appearance model (slowly adapt) - Issue 1: Freeze during clinch
                 new_hist = self._compute_histogram(frame, my_bbox)
                 if new_hist is not None:
-                    # Don't update histogram if in clinch or high overlap (prevents pollution)
                     current_iou = self._calculate_iou(my_bbox, opponent_bbox) if opponent_bbox else 0.0
                     if not self.in_clinch and current_iou < 0.5:
                         self.my_fighter_histogram = 0.9 * self.my_fighter_histogram + 0.1 * new_hist
@@ -454,12 +366,10 @@ class FighterTracker:
             self.my_fighter_bbox = None
             self.my_fighter_lost_count += 1
             
-            # State transitions
             if self.my_fighter_lost_count < self.LOST_FRAME_THRESHOLD:
                 prev_state = self.my_fighter_state
                 self.my_fighter_state = FighterState.TEMP_LOST
                 if self.my_fighter_lost_since is None:
-                    # FIX #4: Correct gap start frame (off by 1)
                     self.my_fighter_lost_since = self.frame_count - 1
             else:
                 prev_state = self.my_fighter_state
@@ -561,13 +471,11 @@ class FighterTracker:
                 self.my_fighter_state = FighterState.OCCLUDED
                 self.opponent_state = FighterState.OCCLUDED
                 
-                # Backup histograms for appearance-based recovery
                 if self.my_fighter_histogram is not None:
                     self.my_fighter_histogram_backup = self.my_fighter_histogram.copy()
                 if self.opponent_histogram is not None:
                     self.opponent_histogram_backup = self.opponent_histogram.copy()
         
-        # Issue 6: Transition out of OCCLUDED when overlap decreases
         elif (self.my_fighter_state == FighterState.OCCLUDED and 
               self.opponent_state == FighterState.OCCLUDED and
               my_bbox is not None and opponent_bbox is not None):
@@ -656,24 +564,16 @@ class FighterTracker:
                       lost_count: int, name: str, frozen: bool = False,
                       clinch_duration: int = 0  # FIX #1: Accept clinch duration
                       ) -> Tuple[Optional[Tuple[int, int, int, int]], TrackingSource, float]:
-        """
-        Track single fighter using multi-strategy approach.
-        
-        Returns:
-            (bbox, source, confidence) or (None, None, 0.0) if lost
-        """
-        # FIX #1: Handle clinch freeze with decaying confidence
+       
         if frozen and last_valid is not None:
             # Confidence decays with clinch duration
             conf = max(0.2, 0.5 - 0.01 * clinch_duration)
             return (last_valid, TrackingSource.FROZEN, conf)
         
-        # Issue 6: Detect takedown events for motion continuity adjustment
         takedown_active = False
         if last_valid is not None and len(history) >= 5:
             takedown_active = self._detect_takedown(history, last_valid)
         
-        # Issue 1: Active re-entry search for LOST_CONFIRMED fighters
         fighter_state = (self.my_fighter_state if name == "my_fighter" 
                         else self.opponent_state)
         reentry_counter = (self.my_fighter_reentry_search_counter if name == "my_fighter"
@@ -682,13 +582,11 @@ class FighterTracker:
                            else self.opponent_texture_features)
         
         if fighter_state == FighterState.LOST_CONFIRMED and reentry_counter % self.REENTRY_SEARCH_INTERVAL == 0:
-            # Perform full-frame search for re-entry
             reentry_bbox = self._search_full_frame_for_reentry(frame, histogram, texture_features, name)
             
             if reentry_bbox is not None:
                 # Validate the found bbox
                 if self._validate_bbox(reentry_bbox, None, name):  # No last_valid for re-entry
-                    # Issue 10: Allow partial frame exits for re-entering fighters
                     if self._validate_partial_frame_exit(reentry_bbox):
                         # Successful re-entry! Reset state and return bbox
                         if name == "my_fighter":
@@ -743,26 +641,22 @@ class FighterTracker:
                         if opponent_bbox_for_check is not None:
                             iou_with_opponent = self._calculate_iou(bbox, opponent_bbox_for_check)
                             if iou_with_opponent > 0.5 and quality < 5.0:
-                                success = False  # CSRT degraded during overlap
+                                success = False  
                 except:
-                    # getResponse() might not be available in all OpenCV versions
                     pass
                 
                 if success:
                     # Validate bbox
                     if self._validate_bbox(bbox, last_valid, name):
-                        # Fix 1: Apply vertical anchor bias toward upper body
                         bbox = self._apply_vertical_anchor_bias(bbox)
                         return (bbox, TrackingSource.CSRT, 1.0)
         
-        # === STRATEGY 2: OPTICAL FLOW (with camera compensation) ===
         if last_valid is not None and self.prev_gray is not None:
             flow_bbox = self._track_with_dense_flow(
                 self.prev_gray, gray, last_valid, global_motion
             )
             
             if flow_bbox is not None and self._validate_bbox(flow_bbox, last_valid, name):
-                # Fix 1: Apply vertical anchor bias toward upper body
                 flow_bbox = self._apply_vertical_anchor_bias(flow_bbox)
                 return (flow_bbox, TrackingSource.FLOW, 0.7)
         
@@ -780,8 +674,6 @@ class FighterTracker:
                 search_bbox = self._apply_vertical_anchor_bias(search_bbox)
                 return (search_bbox, TrackingSource.HIST, 0.6)
         
-        # === STRATEGY 4: MOTION PREDICTION ===
-        # Disable when truly lost
         if len(history) >= 3 and lost_count < self.LOST_FRAME_THRESHOLD:
             predicted_bbox = self._predict_from_motion(history)
             
@@ -798,7 +690,6 @@ class FighterTracker:
     def _track_with_dense_flow(self, prev_gray: np.ndarray, curr_gray: np.ndarray,
                                bbox: Tuple[int, int, int, int], 
                                global_motion: Tuple[float, float]) -> Optional[Tuple[int, int, int, int]]:
-        """Track using dense optical flow in bbox region with camera motion compensation."""
         x, y, w, h = bbox
         
         # Ensure bbox is within frame
@@ -982,8 +873,7 @@ class FighterTracker:
         # Check size
         if w < self.MIN_BOX_SIZE or h < self.MIN_BOX_SIZE:
             return False
-        
-        # Check if bbox is reasonable (not too large)
+# Check if bbox is reasonable (not too large)
         if w > self.frame_width * 0.8 or h > self.frame_height * 0.8:
             return False
         
@@ -1036,14 +926,8 @@ class FighterTracker:
                                    last_valid: Optional[Tuple[int, int, int, int]],
                                    confidence: float,
                                    source: TrackingSource) -> float:
-        """
-        FIX #8: Calculate bbox validity score combining confidence, size stability, displacement.
-        
-        Returns:
-            Score from 0.0 to 1.0 indicating tracking quality
-        """
+       
         score = confidence
-        
         if last_valid is not None:
             # Penalize large displacements
             center_curr = self._bbox_center(bbox)
@@ -1065,17 +949,78 @@ class FighterTracker:
         
         return max(0.0, min(1.0, score))
     
+    def _apply_identity_guard(self, my_bbox: Optional[Tuple[int, int, int, int]],
+                               opponent_bbox: Optional[Tuple[int, int, int, int]]
+                               ) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[Tuple[int, int, int, int]]]:
+        """
+        Lightweight identity guard - prevents sudden swaps by enforcing:
+        1. Centroid jump continuity (max distance check)
+        2. IoU overlap prevention with opponent
+        3. Ground-lock threshold scaling for low-height scenarios
+        4. Fallback to last_valid bbox on violations
+        
+        Always-on, runs before existing validation.
+        """
+        # Guard MY fighter
+        if my_bbox is not None and self.my_fighter_last_valid is not None:
+            my_center = self._bbox_center(my_bbox)
+            my_last_center = self._bbox_center(self.my_fighter_last_valid)
+            centroid_jump = np.sqrt((my_center[0] - my_last_center[0])**2 + 
+                                   (my_center[1] - my_last_center[1])**2)
+            
+            # Step C: Ground-lock - tighten threshold if bbox is low in frame
+            jump_threshold = self.max_centroid_jump
+            _, my_y, _, my_h = my_bbox
+            my_bottom = my_y + my_h
+            if my_bottom > self.ground_lock_y:
+                jump_threshold *= self.GROUND_LOCK_JUMP_REDUCTION
+            
+            # Step A: Centroid jump check
+            jump_violation = centroid_jump > jump_threshold
+            
+            # Step B: IoU overlap check
+            iou_violation = False
+            if opponent_bbox is not None:
+                iou = self._calculate_iou(my_bbox, opponent_bbox)
+                iou_violation = iou > self.GUARD_IOU_THRESHOLD
+            
+            # Fallback if either check fails
+            if jump_violation or iou_violation:
+                my_bbox = self.my_fighter_last_valid  # Fallback
+        
+        # Guard OPPONENT fighter
+        if opponent_bbox is not None and self.opponent_last_valid is not None:
+            opp_center = self._bbox_center(opponent_bbox)
+            opp_last_center = self._bbox_center(self.opponent_last_valid)
+            centroid_jump = np.sqrt((opp_center[0] - opp_last_center[0])**2 + 
+                                    (opp_center[1] - opp_last_center[1])**2)
+            
+            # Step C: Ground-lock - tighten threshold if bbox is low in frame
+            jump_threshold = self.max_centroid_jump
+            _, opp_y, _, opp_h = opponent_bbox
+            opp_bottom = opp_y + opp_h
+            if opp_bottom > self.ground_lock_y:
+                jump_threshold *= self.GROUND_LOCK_JUMP_REDUCTION
+            
+            # Step A: Centroid jump check
+            jump_violation = centroid_jump > jump_threshold
+            
+            # Step B: IoU overlap check
+            iou_violation = False
+            if my_bbox is not None:
+                iou = self._calculate_iou(opponent_bbox, my_bbox)
+                iou_violation = iou > self.GUARD_IOU_THRESHOLD
+            
+            # Fallback if either check fails
+            if jump_violation or iou_violation:
+                opponent_bbox = self.opponent_last_valid  # Fallback
+        
+        return my_bbox, opponent_bbox
+    
     def _prevent_identity_swap(self, my_bbox: Tuple[int, int, int, int],
                                opponent_bbox: Tuple[int, int, int, int]
                                ) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
-        """
-        Fix 2: Prevent identity swap with multi-signal ID confirmation.
-        
-        Enhanced identity validation using:
-        - Spatial history (existing)
-        - Appearance similarity (color histograms)
-        - Motion continuity (velocity direction consistency)
-        """
+       
         # Check if bboxes overlap significantly
         iou = self._calculate_iou(my_bbox, opponent_bbox)
         
@@ -1286,10 +1231,7 @@ class FighterTracker:
         return scene_changed
     
     def _detect_ground_mode(self, my_bbox: Optional[Tuple], opp_bbox: Optional[Tuple]) -> bool:
-        """
-        Issue 2: Detect when both fighters are on the ground.
-        Activates special tracking parameters for ground fighting.
-        """
+        
         if my_bbox is None or opp_bbox is None:
             self.ground_mode_active = False
             self.ground_mode_start_frame = None
@@ -1321,10 +1263,7 @@ class FighterTracker:
         return self.ground_mode_active
     
     def _detect_takedown(self, history: List[Tuple], current_bbox: Tuple) -> bool:
-        """
-        Issue 6: Detect takedown events (rapid downward motion + high overlap).
-        Reduces motion continuity weight during transitions.
-        """
+        
         if len(history) < 5:
             return False
         
@@ -1364,10 +1303,7 @@ class FighterTracker:
         return self.takedown_in_progress
     
     def _compute_texture_features(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
-        """
-        Issue 9: Compute texture features (HOG) for appearance matching.
-        Provides secondary descriptor when colors are similar.
-        """
+       
         x, y, w, h = bbox
         
         # Ensure bbox is within frame
@@ -1403,10 +1339,7 @@ class FighterTracker:
         return features.flatten() if features is not None else None
     
     def _validate_partial_frame_exit(self, bbox: Tuple[int, int, int, int]) -> bool:
-        """
-        Issue 10: Allow bboxes where center is slightly outside frame.
-        Fighter is still trackable if >30% of bbox area is visible.
-        """
+       
         x, y, w, h = bbox
         
         # Calculate bbox area
@@ -1438,10 +1371,7 @@ class FighterTracker:
             return visibility_ratio > 0.5  # Normal validation for fully visible bboxes
     
     def _get_adaptive_max_displacement(self, name: str) -> float:
-        """
-        Issue 8: Make max displacement adaptive based on recent velocity.
-        Allow higher displacement for fighters that were already moving fast.
-        """
+       
         recent_velocity = (self.my_fighter_recent_velocity if name == "my_fighter" 
                           else self.opponent_recent_velocity)
         
@@ -1457,10 +1387,7 @@ class FighterTracker:
     
     def _search_full_frame_for_reentry(self, frame: np.ndarray, histogram: np.ndarray, 
                                      texture_features: Optional[np.ndarray], name: str) -> Optional[Tuple[int, int, int, int]]:
-        """
-        Issue 1: Active full-frame search for LOST_CONFIRMED fighters.
-        Scans entire frame (not just near last_valid) for re-appearance.
-        """
+      
         if histogram is None:
             return None
         
@@ -1511,10 +1438,7 @@ class FighterTracker:
         return best_match
     
     def _detect_potential_referee(self, frame: np.ndarray, motion_frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-        """
-        Issue 7: Detect third objects (referees) that might occlude fighters.
-        Identifies large, fast-moving objects that differ from fighter motion patterns.
-        """
+       
         if self.referee_detection_cooldown > 0:
             self.referee_detection_cooldown -= 1
             return None
@@ -1576,15 +1500,7 @@ class FighterTracker:
     
     def _validate_bbox(self, bbox: Tuple[int, int, int, int], last_valid: Optional[Tuple], 
                       name: str) -> bool:
-        """
-        Validate bounding box with enhanced checks for MMA scenarios.
-        
-        Issues addressed:
-        - Issue 4: Allow larger bboxes when only one fighter visible
-        - Issue 8: Adaptive max displacement based on recent velocity
-        - Issue 10: Allow partial frame exits
-        - Issue 6: Ground mode adjustments
-        """
+       
         x, y, w, h = bbox
         
         # Basic size checks
@@ -1645,10 +1561,7 @@ class FighterTracker:
         return True
     
     def _apply_cage_aware_histogram_masking(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> np.ndarray:
-        """
-        Issue 5: Create cage-aware histogram by masking edge pixels when near boundaries.
-        Prevents cage background pollution during clinch against cage.
-        """
+       
         x, y, w, h = bbox
         
         # Extract ROI
@@ -1710,11 +1623,7 @@ class FighterTracker:
             self.opponent_confidence = 0.7
     
     def _compute_histogram(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
-        """
-        Compute color histogram for appearance model with cage-aware masking.
         
-        Issue 5: Prevents cage background pollution during clinch against cage.
-        """
         # Issue 5: Apply cage-aware masking
         roi, mask = self._apply_cage_aware_histogram_masking(frame, bbox)
         
@@ -1733,20 +1642,14 @@ class FighterTracker:
         return hist
     
     def _apply_vertical_anchor_bias(self, bbox: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
-        """
-        Fix 1: Add vertical anchor bias toward upper body.
-        
-        During clinch/ground positions, bbox tends to slide downward to legs.
-        This re-centers the bbox to prioritize torso/chest region over feet/mat contact.
-        """
+     
         x, y, w, h = bbox
         
         # Calculate current center
         cx = x + w // 2
         cy = y + h // 2
         
-        # Apply upward bias to center (prioritize upper body)
-        # Move center upward by 15% of bbox height to favor torso over legs
+       
         bias_factor = 0.15
         new_cy = int(cy - h * bias_factor)
         
@@ -1791,15 +1694,7 @@ class FighterTracker:
         return intersection / union
     
     def get_status(self) -> Dict[str, any]:
-        """
-        Get current tracking status with presence hooks.
-        
-        Returns comprehensive state for presence zone tracking.
-        
-        FIX #5: Presence should use validity threshold, not just bbox existence.
-        Recommended usage in presence zones:
-            visible = bbox is not None and validity > VALIDITY_THRESHOLD
-        """
+       
         return {
             "frame": self.frame_count,
             "my_fighter": {
@@ -1810,7 +1705,7 @@ class FighterTracker:
                 "lost_since": self.my_fighter_lost_since,
                 "confidence": self.my_fighter_confidence,
                 "validity": self.my_fighter_validity,
-                "reliable": self.my_fighter_bbox is not None and self.my_fighter_validity > self.VALIDITY_THRESHOLD,  # FIX #5
+                "reliable": self.my_fighter_bbox is not None and self.my_fighter_validity > self.VALIDITY_THRESHOLD,
                 "source": self.my_fighter_source.value if self.my_fighter_source else None
             },
             "opponent": {
@@ -1821,7 +1716,7 @@ class FighterTracker:
                 "lost_since": self.opponent_lost_since,
                 "confidence": self.opponent_confidence,
                 "validity": self.opponent_validity,
-                "reliable": self.opponent_bbox is not None and self.opponent_validity > self.VALIDITY_THRESHOLD,  # FIX #5
+                "reliable": self.opponent_bbox is not None and self.opponent_validity > self.VALIDITY_THRESHOLD,  
                 "source": self.opponent_source.value if self.opponent_source else None
             },
             "in_clinch": self.in_clinch
