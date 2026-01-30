@@ -4,6 +4,21 @@ from typing import Optional, Tuple, Dict, List
 from enum import Enum
 
 
+# OpenCV CSRT compatibility - handle both old and new versions
+def create_csrt_tracker():
+    """Create CSRT tracker with compatibility for different OpenCV versions."""
+    try:
+        # Try newer OpenCV (4.5.1+) where CSRT is in legacy module
+        return cv2.legacy.TrackerCSRT_create()
+    except AttributeError:
+        try:
+            # Fall back to older OpenCV versions
+            return cv2.TrackerCSRT_create()
+        except AttributeError:
+            raise RuntimeError("CSRT tracker not available in this OpenCV version. "
+                             "Please install OpenCV >= 4.5.1 or with contrib modules.")
+
+
 class FighterState(Enum):
     """Fighter tracking state."""
     VISIBLE = "visible"
@@ -108,6 +123,33 @@ class FighterTracker:
         self.my_fighter_histogram = None
         self.opponent_histogram = None
         
+        # === IMMUTABLE IDENTITY ANCHORS (LAYER 1) ===
+        # These are set ONCE at initialization and NEVER updated
+        # Used ONLY for identity verification, not tracking
+        self.my_anchor_hist = None      # Immutable reference to MY_FIGHTER appearance
+        self.opp_anchor_hist = None     # Immutable reference to OPPONENT appearance
+        
+        # Identity verification thresholds (STEP 2: Tighten thresholds)
+        self.ANCHOR_VERIFY_ACCEPT = 0.6   # normal operation
+        self.ANCHOR_VERIFY_RELOCK = 0.7   # recovery from uncertainty
+        
+        # Collision detection for mutual exclusion
+        self.COLLISION_THRESHOLD = 0.6  # IoU threshold for identity collision
+        
+        # === STEP 1: IDENTITY STATE MACHINE ===
+        self.my_identity_state = "CERTAIN"  # or "UNCERTAIN"
+        self.identity_uncertain_frames = 0
+        self.identity_relock_frames = 0
+        
+        # State transition thresholds
+        self.N_FAIL = 3  # frames to enter UNCERTAIN
+        self.M_CONSECUTIVE = 3  # frames to re-lock
+        
+        # === STEP 3: CUMULATIVE DRIFT PROTECTION ===
+        self.my_last_verified_center = None
+        self.my_cumulative_drift = 0.0
+        self.MAX_CUMULATIVE_DRIFT = self.max_displacement * 2.0  # 2x single-frame limit
+        
         # For optical flow fallback
         self.prev_gray = None
         
@@ -164,8 +206,8 @@ class FighterTracker:
         self.my_fighter_bbox = my_fighter_bbox
         self.opponent_bbox = opponent_bbox
         
-        self.my_tracker = cv2.TrackerCSRT_create()
-        self.opponent_tracker = cv2.TrackerCSRT_create()
+        self.my_tracker = create_csrt_tracker()
+        self.opponent_tracker = create_csrt_tracker()
         
         self.my_tracker.init(frame, my_fighter_bbox)
         self.opponent_tracker.init(frame, opponent_bbox)
@@ -190,8 +232,25 @@ class FighterTracker:
         cx, cy = self._bbox_center(opponent_bbox)
         self.opponent_history.append((cx, cy, opponent_bbox[2], opponent_bbox[3], 0))
         
-        self.my_fighter_histogram = self._compute_histogram(frame, my_fighter_bbox)
-        self.opponent_histogram = self._compute_histogram(frame, opponent_bbox)
+        # === LAYER 1: CREATE IMMUTABLE ANCHORS (ONCE, NEVER UPDATED) ===
+        self.my_anchor_hist = self._compute_histogram(frame, my_fighter_bbox)
+        self.opp_anchor_hist = self._compute_histogram(frame, opponent_bbox)
+        
+        # Adaptive histograms (for tracking, NOT identity)
+        self.my_fighter_histogram = self.my_anchor_hist.copy() if self.my_anchor_hist is not None else None
+        self.opponent_histogram = self.opp_anchor_hist.copy() if self.opp_anchor_hist is not None else None
+        
+        # Initialize identity state machine
+        self.my_identity_state = "CERTAIN"
+        self.identity_uncertain_frames = 0
+        self.identity_relock_frames = 0
+        self.my_last_verified_center = self._bbox_center(my_fighter_bbox)
+        self.my_cumulative_drift = 0.0
+        
+        print("🔒 Immutable identity anchors created")
+        print(f"   MY_FIGHTER anchor: {self.my_anchor_hist is not None}")
+        print(f"   OPPONENT anchor:   {self.opp_anchor_hist is not None}")
+        print(f"   Identity state: {self.my_identity_state}")
         
         # Issue 9: Initialize texture features for appearance matching
         self.my_fighter_texture_features = self._compute_texture_features(frame, my_fighter_bbox)
@@ -312,13 +371,80 @@ class FighterTracker:
             clinch_duration=clinch_duration  # FIX #1: Pass duration
         )
         
-        # === IDENTITY GUARD: Always-on lightweight protection ===
-        my_bbox, opponent_bbox = self._apply_identity_guard(my_bbox, opponent_bbox)
+        # === STEP 5: IDENTITY STATE MACHINE ===
+        # Verify identities BEFORE committing to state
+        if my_bbox is not None and self.my_anchor_hist is not None:
+            # Get raw similarity for drift checking
+            current_hist = self._compute_histogram(frame, my_bbox)
+            similarity = 0.0
+            if current_hist is not None:
+                similarity = cv2.compareHist(self.my_anchor_hist, current_hist, cv2.HISTCMP_CORREL)
+            
+            # Use state-aware threshold for verification
+            threshold = (self.ANCHOR_VERIFY_RELOCK if self.my_identity_state == "UNCERTAIN" 
+                         else self.ANCHOR_VERIFY_ACCEPT)
+            my_verified = similarity >= threshold
+            
+            # STEP 3: Cumulative drift protection - accumulate when verification is weak (< 0.6)
+            if self.my_last_verified_center is not None:
+                current_center = self._bbox_center(my_bbox)
+                drift = np.linalg.norm(np.array(current_center) - np.array(self.my_last_verified_center))
+                
+                if similarity < 0.6:  # Weak verification - accumulate drift
+                    self.my_cumulative_drift += drift
+                elif my_verified and self.my_identity_state == "CERTAIN":
+                    # Strong verification in CERTAIN state - reset drift
+                    self.my_cumulative_drift = 0.0
+                    self.my_last_verified_center = current_center
+            
+            if my_verified:
+                if self.my_last_verified_center is None:
+                    # First verified frame
+                    self.my_last_verified_center = self._bbox_center(my_bbox)
+                
+                # State transition: UNCERTAIN → CERTAIN
+                if self.my_identity_state == "UNCERTAIN":
+                    self.identity_relock_frames += 1
+                    if self.identity_relock_frames >= self.M_CONSECUTIVE:
+                        self.my_identity_state = "CERTAIN"
+                        self.identity_uncertain_frames = 0
+                        self.my_cumulative_drift = 0.0
+                        print(f"✅ Frame {self.frame_count}: MY_FIGHTER identity re-locked")
+                else:
+                    self.identity_relock_frames = 0
+            
+            else:
+                # Verification failed
+                self.identity_uncertain_frames += 1
+                self.identity_relock_frames = 0
+                
+                # State transition: CERTAIN → UNCERTAIN
+                if self.my_identity_state == "CERTAIN" and self.identity_uncertain_frames >= self.N_FAIL:
+                    self.my_identity_state = "UNCERTAIN"
+                    self.my_cumulative_drift = 0.0  # Reset drift when entering UNCERTAIN
+                    print(f"⚠️ Frame {self.frame_count}: MY_FIGHTER identity UNCERTAIN")
+                
+                # Revert to last valid
+                my_bbox = self.my_fighter_last_valid
+            
+            # Check cumulative drift threshold
+            if self.my_cumulative_drift > self.MAX_CUMULATIVE_DRIFT:
+                if self.my_identity_state == "CERTAIN":
+                    self.my_identity_state = "UNCERTAIN"
+                    self.my_cumulative_drift = 0.0
+                    print(f"⚠️ Frame {self.frame_count}: MY_FIGHTER drift exceeded - entering UNCERTAIN")
         
-        if (not self.in_clinch and 
-            self.separation_cooldown_frames == 0 and  # Issue 4: Disable during separation
-            my_bbox is not None and opponent_bbox is not None):
-            my_bbox, opponent_bbox = self._prevent_identity_swap(my_bbox, opponent_bbox)
+        if opponent_bbox is not None and self.opp_anchor_hist is not None:
+            opp_verified = self._verify_identity_against_anchor(frame, opponent_bbox, self.opp_anchor_hist)
+            if not opp_verified:
+                opponent_bbox = self.opponent_last_valid  # Revert to last known good
+        
+        # === LAYER 3: MUTUAL EXCLUSION (ANTI-COLLAPSE) ===
+        # Never allow both boxes to track same person
+        my_bbox, opponent_bbox = self._apply_mutual_exclusion(frame, my_bbox, opponent_bbox)
+        
+        # === LAYER 1 (lightweight): Geometric sanity check ===
+        my_bbox, opponent_bbox = self._apply_identity_guard(my_bbox, opponent_bbox)
         
         reinit_my = False
         
@@ -350,17 +476,39 @@ class FighterTracker:
                 self.my_fighter_lost_count = 0
                 self.my_fighter_lost_since = None
                 
-                if my_source in {TrackingSource.CSRT, TrackingSource.FLOW, TrackingSource.HIST}:
+                # === LAYER 4: FREEZE CHECK - Only update history when NOT frozen ===
+                is_frozen = (
+                    self.in_clinch or 
+                    self.separation_cooldown_frames > 0 or
+                    (opponent_bbox is not None and self._calculate_iou(my_bbox, opponent_bbox) > 0.6)
+                )
+                
+                # STEP 6: Freeze learning in UNCERTAIN state
+                if (my_source in {TrackingSource.CSRT, TrackingSource.FLOW, TrackingSource.HIST} and 
+                    not is_frozen and 
+                    self.my_identity_state == "CERTAIN"):  # Only update when CERTAIN
                     cx, cy = self._bbox_center(my_bbox)
                     self.my_fighter_history.append((cx, cy, my_bbox[2], my_bbox[3], self.frame_count))
                 
                 if my_source != TrackingSource.CSRT or prev_state != FighterState.VISIBLE:
                     reinit_my = True
                 
+                # === STEP 6: FREEZE LEARNING WHEN UNCERTAIN ===
+                # Only update adaptive histogram when:
+                # 1. Identity state is CERTAIN
+                # 2. Not in clinch
+                # 3. Low overlap with opponent
+                # 4. Identity verified against anchor
                 new_hist = self._compute_histogram(frame, my_bbox)
                 if new_hist is not None:
                     current_iou = self._calculate_iou(my_bbox, opponent_bbox) if opponent_bbox else 0.0
-                    if not self.in_clinch and current_iou < 0.5:
+                    identity_certain = self._verify_identity_against_anchor(frame, my_bbox, self.my_anchor_hist)
+                    
+                    if (self.my_identity_state == "CERTAIN" and  # NEW: only update when CERTAIN
+                        not self.in_clinch and 
+                        current_iou < 0.5 and 
+                        identity_certain and
+                        self.my_fighter_histogram is not None):
                         self.my_fighter_histogram = 0.9 * self.my_fighter_histogram + 0.1 * new_hist
         else:
             self.my_fighter_bbox = None
@@ -413,8 +561,15 @@ class FighterTracker:
                 self.opponent_lost_count = 0
                 self.opponent_lost_since = None
                 
+                # === LAYER 4: FREEZE CHECK ===
+                is_frozen = (
+                    self.in_clinch or 
+                    self.separation_cooldown_frames > 0 or
+                    (my_bbox is not None and self._calculate_iou(my_bbox, opponent_bbox) > 0.6)
+                )
+                
                 # FIX #7: Only append history for reliable sources
-                if opp_source in {TrackingSource.CSRT, TrackingSource.FLOW, TrackingSource.HIST}:
+                if opp_source in {TrackingSource.CSRT, TrackingSource.FLOW, TrackingSource.HIST} and not is_frozen:
                     cx, cy = self._bbox_center(opponent_bbox)
                     self.opponent_history.append((cx, cy, opponent_bbox[2], opponent_bbox[3], self.frame_count))
                 
@@ -423,11 +578,14 @@ class FighterTracker:
                     reinit_opp = True
                 
                 # Update appearance model - Issue 1: Freeze during clinch
+                # === LAYER 4: FREEZE LEARNING DURING UNCERTAINTY ===
                 new_hist = self._compute_histogram(frame, opponent_bbox)
                 if new_hist is not None:
                     # Don't update histogram if in clinch or high overlap (prevents pollution)
                     current_iou = self._calculate_iou(my_bbox, opponent_bbox) if my_bbox else 0.0
-                    if not self.in_clinch and current_iou < 0.5:
+                    identity_certain = self._verify_identity_against_anchor(frame, opponent_bbox, self.opp_anchor_hist)
+                    if (not self.in_clinch and current_iou < 0.5 and identity_certain and
+                        self.opponent_histogram is not None):
                         self.opponent_histogram = 0.9 * self.opponent_histogram + 0.1 * new_hist
         else:
             self.opponent_bbox = None
@@ -452,11 +610,11 @@ class FighterTracker:
         
         # Reinitialize CSRT only when needed
         if reinit_my and my_bbox is not None:
-            self.my_tracker = cv2.TrackerCSRT_create()
+            self.my_tracker = create_csrt_tracker()
             self.my_tracker.init(frame, my_bbox)
         
         if reinit_opp and opponent_bbox is not None:
-            self.opponent_tracker = cv2.TrackerCSRT_create()
+            self.opponent_tracker = create_csrt_tracker()
             self.opponent_tracker.init(frame, opponent_bbox)
         
         # Issue 6: Detect occlusion state when fighters overlap significantly
@@ -565,10 +723,12 @@ class FighterTracker:
                       clinch_duration: int = 0  # FIX #1: Accept clinch duration
                       ) -> Tuple[Optional[Tuple[int, int, int, int]], TrackingSource, float]:
        
+        # LAYER 4: Freeze learning, NOT tracking
+        # During freeze, tracking continues but learning/state updates are blocked
+        # (handled in the main update loop). This block is kept only for potential
+        # confidence decay logic; we do NOT early-return here.
         if frozen and last_valid is not None:
-            # Confidence decays with clinch duration
-            conf = max(0.2, 0.5 - 0.01 * clinch_duration)
-            return (last_valid, TrackingSource.FROZEN, conf)
+            _ = max(0.2, 0.5 - 0.01 * clinch_duration)
         
         takedown_active = False
         if last_valid is not None and len(history) >= 5:
@@ -754,6 +914,15 @@ class FighterTracker:
                              histogram: np.ndarray, history: List[Tuple],
                              expand_search: bool = False, name: str = "") -> Optional[Tuple[int, int, int, int]]:
         """Search for fighter using color histogram matching."""
+        
+        # === LAYER 1: Use immutable anchor for re-acquisition when LOST ===
+        fighter_state = (self.my_fighter_state if name == "my_fighter" 
+                        else self.opponent_state)
+        
+        if fighter_state == FighterState.LOST_CONFIRMED:
+            anchor = self.my_anchor_hist if name == "my_fighter" else self.opp_anchor_hist
+            if anchor is not None:
+                histogram = anchor  # Override with immutable anchor
         x, y, w, h = last_bbox
         cx, cy = x + w // 2, y + h // 2
         
@@ -826,6 +995,43 @@ class FighterTracker:
         
         iou = self._calculate_iou(bbox, opponent_bbox)
         return iou > self.OVERLAP_IOU_THRESHOLD
+    
+    def _verify_identity_against_anchor(self, frame: np.ndarray, 
+                                        bbox: Tuple[int, int, int, int],
+                                        anchor_hist: Optional[np.ndarray]) -> bool:
+        """
+        LAYER 1: Binary identity verification against immutable anchor.
+        
+        This is the ONLY function that decides "is this still the same fighter?"
+        
+        Args:
+            frame: Current frame
+            bbox: Bounding box to verify
+            anchor_hist: Immutable reference histogram (my_anchor_hist or opp_anchor_hist)
+        
+        Returns:
+            True if bbox appearance matches anchor (verified identity)
+            False if bbox does NOT match anchor (reject, revert, or LOST)
+        """
+        if bbox is None or anchor_hist is None:
+            return False
+        
+        # Compute current appearance
+        current_hist = self._compute_histogram(frame, bbox)
+        if current_hist is None:
+            return False
+        
+        # Compare to immutable anchor
+        similarity = cv2.compareHist(anchor_hist, current_hist, cv2.HISTCMP_CORREL)
+        
+        # STEP 4: Use state-aware threshold
+        threshold = (self.ANCHOR_VERIFY_RELOCK if self.my_identity_state == "UNCERTAIN" 
+                     else self.ANCHOR_VERIFY_ACCEPT)
+        
+        # Binary decision (no confidence weighting)
+        verified = similarity >= threshold
+        
+        return verified
     
     def _predict_from_motion(self, history: List[Tuple]) -> Optional[Tuple[int, int, int, int]]:
         """Predict next position from motion history using velocity."""
@@ -1017,118 +1223,55 @@ class FighterTracker:
         
         return my_bbox, opponent_bbox
     
-    def _prevent_identity_swap(self, my_bbox: Tuple[int, int, int, int],
-                               opponent_bbox: Tuple[int, int, int, int]
-                               ) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int]]:
-       
-        # Check if bboxes overlap significantly
-        iou = self._calculate_iou(my_bbox, opponent_bbox)
+    def _apply_mutual_exclusion(self, frame: np.ndarray,
+                                my_bbox: Optional[Tuple[int, int, int, int]],
+                                opponent_bbox: Optional[Tuple[int, int, int, int]]
+                                ) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[Tuple[int, int, int, int]]]:
+        """
+        LAYER 3: Mutual Exclusion - Prevent both boxes from tracking same person.
         
-        if iou < self.OVERLAP_IOU_THRESHOLD:
-            # No significant overlap, likely correct assignment
+        Uses ANCHOR VERIFICATION (not confidence voting) to resolve collisions.
+        
+        Rules:
+            1. If no collision (IoU < threshold): allow both
+            2. If collision detected:
+                - Verify MY_FIGHTER against my_anchor
+                - Verify OPPONENT against opp_anchor
+                - Revert any that fail verification
+                - NEVER allow both to update during collision
+        """
+        if my_bbox is None or opponent_bbox is None:
             return my_bbox, opponent_bbox
         
-        # Overlap detected - use multi-signal validation
-        confidence_correct = 0.0
-        confidence_swapped = 0.0
+        # Check for collision
+        iou = self._calculate_iou(my_bbox, opponent_bbox)
         
-        # Signal 1: Spatial history (existing logic)
-        if len(self.my_fighter_history) >= 2 and len(self.opponent_history) >= 2:
-            my_expected_cx = self.my_fighter_history[-1][0]
-            my_expected_cy = self.my_fighter_history[-1][1]
-            
-            opp_expected_cx = self.opponent_history[-1][0]
-            opp_expected_cy = self.opponent_history[-1][1]
-            
-            my_cx, my_cy = self._bbox_center(my_bbox)
-            opp_cx, opp_cy = self._bbox_center(opponent_bbox)
-            
-            # Calculate spatial distances
-            dist_my_to_my = np.sqrt((my_cx - my_expected_cx)**2 + (my_cy - my_expected_cy)**2)
-            dist_my_to_opp = np.sqrt((my_cx - opp_expected_cx)**2 + (my_cy - opp_expected_cy)**2)
-            dist_opp_to_my = np.sqrt((opp_cx - my_expected_cx)**2 + (opp_cy - my_expected_cy)**2)
-            dist_opp_to_opp = np.sqrt((opp_cx - opp_expected_cx)**2 + (opp_cy - opp_expected_cy)**2)
-            
-            # Normalize by max displacement for scoring
-            max_dist = self.max_displacement
-            spatial_correct = 1.0 - min(1.0, (dist_my_to_my + dist_opp_to_opp) / (2 * max_dist))
-            spatial_swapped = 1.0 - min(1.0, (dist_my_to_opp + dist_opp_to_my) / (2 * max_dist))
-            
-            confidence_correct += spatial_correct * 0.4  # 40% weight
-            confidence_swapped += spatial_swapped * 0.4
+        # STEP 7: Identity-aware mutual exclusion
+        # Verify both against anchors (always check, not just on high IoU)
+        my_verified = self._verify_identity_against_anchor(frame, my_bbox, self.my_anchor_hist)
+        opp_verified = self._verify_identity_against_anchor(frame, opponent_bbox, self.opp_anchor_hist)
         
-        # Signal 2: Appearance similarity (color histograms)
-        if (self.my_fighter_histogram is not None and self.opponent_histogram is not None and
-            hasattr(self, 'prev_gray')):  # Only if we have current frame context
-            
-            # Compute histograms for current bboxes
-            current_frame = getattr(self, '_current_frame', None)
-            if current_frame is not None:
-                hist_my_current = self._compute_histogram(current_frame, my_bbox)
-                hist_opp_current = self._compute_histogram(current_frame, opponent_bbox)
-                
-                if hist_my_current is not None and hist_opp_current is not None:
-                    # Compare my_bbox with my_fighter_histogram vs opponent_histogram
-                    similarity_my_my = cv2.compareHist(self.my_fighter_histogram, hist_my_current, cv2.HISTCMP_CORREL)
-                    similarity_my_opp = cv2.compareHist(self.opponent_histogram, hist_my_current, cv2.HISTCMP_CORREL)
-                    
-                    # Compare opponent_bbox with histograms
-                    similarity_opp_my = cv2.compareHist(self.my_fighter_histogram, hist_opp_current, cv2.HISTCMP_CORREL)
-                    similarity_opp_opp = cv2.compareHist(self.opponent_histogram, hist_opp_current, cv2.HISTCMP_CORREL)
-                    
-                    # Appearance confidence (correct assignment should have higher similarity)
-                    appearance_correct = (similarity_my_my + similarity_opp_opp) / 2
-                    appearance_swapped = (similarity_my_opp + similarity_opp_my) / 2
-                    
-                    confidence_correct += appearance_correct * 0.3  # 30% weight
-                    confidence_swapped += appearance_swapped * 0.3
+        # Trigger mutual exclusion if:
+        # 1. High overlap (original rule), OR
+        # 2. Moderate overlap + verification failure
+        trigger_exclusion = (iou > self.COLLISION_THRESHOLD or 
+                            (iou > 0.3 and (not my_verified or not opp_verified)))
         
-        # Signal 3: Motion continuity (velocity direction)
-        if len(self.my_fighter_history) >= 3 and len(self.opponent_history) >= 3:
-            # Calculate recent velocity vectors
-            my_vel_x = self.my_fighter_history[-1][0] - self.my_fighter_history[-2][0]
-            my_vel_y = self.my_fighter_history[-1][1] - self.my_fighter_history[-2][1]
-            
-            opp_vel_x = self.opponent_history[-1][0] - self.opponent_history[-2][0]
-            opp_vel_y = self.opponent_history[-1][1] - self.opponent_history[-2][1]
-            
-            # Current displacement vectors
-            my_cx, my_cy = self._bbox_center(my_bbox)
-            opp_cx, opp_cy = self._bbox_center(opponent_bbox)
-            
-            my_prev_cx, my_prev_cy = self.my_fighter_history[-1][0], self.my_fighter_history[-1][1]
-            opp_prev_cx, opp_prev_cy = self.opponent_history[-1][0], self.opponent_history[-1][1]
-            
-            my_disp_x = my_cx - my_prev_cx
-            my_disp_y = my_cy - my_prev_cy
-            opp_disp_x = opp_cx - opp_prev_cx
-            opp_disp_y = opp_cy - opp_prev_cy
-            
-            # Check velocity continuity (dot product similarity)
-            def velocity_similarity(vel_x, vel_y, disp_x, disp_y):
-                vel_mag = np.sqrt(vel_x**2 + vel_y**2)
-                disp_mag = np.sqrt(disp_x**2 + disp_y**2)
-                if vel_mag < 1 or disp_mag < 1:
-                    return 0.5  # Neutral if too slow
-                
-                # Cosine similarity
-                dot = vel_x * disp_x + vel_y * disp_y
-                return max(0, min(1, dot / (vel_mag * disp_mag)))
-            
-            motion_correct = (velocity_similarity(my_vel_x, my_vel_y, my_disp_x, my_disp_y) + 
-                            velocity_similarity(opp_vel_x, opp_vel_y, opp_disp_x, opp_disp_y)) / 2
-            motion_swapped = (velocity_similarity(my_vel_x, my_vel_y, opp_disp_x, opp_disp_y) + 
-                            velocity_similarity(opp_vel_x, opp_vel_y, my_disp_x, my_disp_y)) / 2
-            
-            confidence_correct += motion_correct * 0.3  # 30% weight
-            confidence_swapped += motion_swapped * 0.3
+        if not trigger_exclusion:
+            # No collision - normal operation
+            return my_bbox, opponent_bbox
         
-        # Decision: Only swap if swapped confidence is significantly higher
-        confidence_threshold = 0.1  # Require clear advantage for swap
+        # Resolution logic
+        if not my_verified:
+            my_bbox = self.my_fighter_last_valid  # Revert MY
         
-        if confidence_swapped > confidence_correct + confidence_threshold:
-            # Swap detected - correct it
-            return opponent_bbox, my_bbox
+        if not opp_verified:
+            opponent_bbox = self.opponent_last_valid  # Revert OPP
+        
+        # Critical: NEVER allow both to track same identity during collision
+        if not my_verified and not opp_verified:
+            my_bbox = self.my_fighter_last_valid
+            opponent_bbox = self.opponent_last_valid
         
         return my_bbox, opponent_bbox
     
@@ -1706,7 +1849,9 @@ class FighterTracker:
                 "confidence": self.my_fighter_confidence,
                 "validity": self.my_fighter_validity,
                 "reliable": self.my_fighter_bbox is not None and self.my_fighter_validity > self.VALIDITY_THRESHOLD,
-                "source": self.my_fighter_source.value if self.my_fighter_source else None
+                "source": self.my_fighter_source.value if self.my_fighter_source else None,
+                "identity_state": self.my_identity_state,  # STEP 8: Identity state logging
+                "identity_confident": self.my_identity_state == "CERTAIN"  # STEP 8: Confidence flag
             },
             "opponent": {
                 "visible": self.opponent_bbox is not None,
