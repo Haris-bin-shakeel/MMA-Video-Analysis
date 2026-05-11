@@ -1,2 +1,0 @@
-# Distance, overlap, velocity helpers
-
